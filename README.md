@@ -1,3 +1,86 @@
+# Neuron explorer: Llama + SOM research fork
+
+Adaptation of [lyramakesmusic/neuron-explorer](https://github.com/lyramakesmusic/neuron-explorer)
+for `meta-llama/Llama-3.2-3B-Instruct`, with model-specific explorer data and a separate
+self-organizing map (SOM) research pipeline. The pinned checkpoint revision is
+`0cb88a4f764b7a12671c53f0838cd831a0843b95` (28 decoder layers, 8,192 MLP neurons per layer).
+
+## Install and launch on Apple Silicon
+
+```sh
+uv sync
+# Requires accepted Meta model terms and Hugging Face access for this checkpoint.
+# Authenticate using `uv run hf auth login` if access is not already configured.
+uv run hf download meta-llama/Llama-3.2-3B-Instruct --revision 0cb88a4f764b7a12671c53f0838cd831a0843b95
+EXPLORER_DEVICE=mps uv run python explorer/server.py
+```
+
+Open http://127.0.0.1:8791. MPS uses float16 weights on the Apple GPU. Use
+`EXPLORER_DEVICE=cpu` for CPU execution. The download command stores model weights in the standard Hugging
+Face cache, outside this repository. No credentials belong in source or command arguments.
+For reproducible runs, keep the default pinned revision; custom checkpoints can use
+`EXPLORER_MODEL` and `EXPLORER_REVISION`.
+
+Derived caches, neuron names, statistics, and sweep runs are isolated by model and revision.
+The bundled upstream Qwen data is not Llama data. A fresh Llama installation initially has
+no precomputed sweeps or layout caches; the interface reports their availability. Loading
+the model does not automatically run a large corpus sweep or generate all-neuron caches.
+
+## ChatGPT research assistant
+
+The assistant panel uses the installed Codex CLI with your ChatGPT sign-in. Check access with
+`codex login status`; sign in with `codex login` if needed. The explorer does not copy or store
+account credentials. Set `EXPLORER_CODEX_MODEL` to choose an available Codex model, or
+leave it unset for the CLI default. It invokes a read-only Codex process with only its explorer MCP server
+configured. Chats and selected explorer-tool results are sent to OpenAI when you use the panel;
+Llama inference remains local. Chat history stays under the model-specific ignored cache.
+The panel supports text and image uploads; PDF uploads return an explicit unsupported-file
+message. Persistent neuron naming remains available through the explorer naming field.
+
+This follows the [official non-interactive Codex integration](https://learn.chatgpt.com/docs/non-interactive-mode)
+and [MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+
+## SOM research
+
+See [the research guide](docs/SOM_RESEARCH.md) for paired data collection, SOM fitting,
+projection interventions, baselines, and held-out evaluation. The SOM is a separate
+research method; the explorer's existing UMAP neuron layout is not a SOM.
+
+```sh
+uv run python -m research.som_pipeline --help
+uv run pytest -q
+```
+
+The research pipeline is experimental infrastructure. Successful tests or generation do
+not establish reduced sycophancy, novelty, or publishable results. Evaluate false-pressure
+responses alongside truthful agreement and valid corrections on held-out questions.
+
+The supported Hugging Face statistics tools also accept `--device mps` and `--revision`:
+
+```sh
+uv run python sweep/neuron_stats.py --device mps --layers 14 --batch 1 --seq-len 128 --tokens 1024
+uv run python sweep/steer_lens.py --device mps --layers 14 --neurons-per-batch 1
+```
+
+These commands perform real collection; they are not run by installation. Even a single
+steer-lens layer requires thousands of forward passes. Use small batches on shared memory.
+Steer-lens dose calibration uses four fixed contexts; its relative doses are not directly
+comparable to corpus-calibrated live steering doses.
+The upstream custom-vLLM pod scripts, capture tools, and equivalence checker below are a
+separate CUDA workflow and have not been validated on MPS. Do not run `setup_pod.sh` on a Mac.
+
+## Attribution and license status
+
+This fork preserves upstream source and documentation. At the time of adaptation the
+upstream repository did not provide a license file. This fork does not grant a new license
+to that source; resolve permission before redistributing it under a publication license.
+Meta's model license and acceptable-use terms separately apply to the checkpoint.
+
+## Original upstream documentation
+
+The following describes the original Qwen workflow. Its flat cache paths, model-specific
+shell scripts, and GPU-pod setup are historical reference, not the Llama launch instructions.
+
 # neuron explorer
 
 Steering-first neuron explorer for Qwen3.5-4B. Every MLP neuron in a layer is pushed up and down on a few prompts, every

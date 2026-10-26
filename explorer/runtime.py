@@ -12,10 +12,35 @@ import threading
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+from transformers import AutoTokenizer
 
-MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
-NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
+try:
+    from .model_adapter import (
+        DEFAULT_MODEL,
+        ModelAdapter,
+        cached_config_metadata,
+        infer_model_family,
+        load_model_and_tokenizer,
+        model_cache_namespace,
+        resolve_device,
+        resolve_model_revision,
+    )
+except ImportError:  # Support direct script imports from explorer/server.py.
+    from model_adapter import (
+        DEFAULT_MODEL,
+        ModelAdapter,
+        cached_config_metadata,
+        infer_model_family,
+        load_model_and_tokenizer,
+        model_cache_namespace,
+        resolve_device,
+        resolve_model_revision,
+    )
+
+MODEL = os.environ.get("EXPLORER_MODEL", DEFAULT_MODEL)
+MODEL_REVISION = resolve_model_revision(MODEL)
+NO_MODEL = os.environ.get("EXPLORER_NO_MODEL", "").strip().lower() not in {"", "0", "false", "no"}
+# cache-only: never download or load weights
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
     "and by the twelfth century the town had a market, a bridge, and a quarrel with its neighbours over tolls. "
@@ -28,16 +53,33 @@ CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 
 
 class Runtime:
-    def __init__(self, stats_dir):
-        self.stats_dir = stats_dir
-        os.makedirs(CACHE, exist_ok=True)
-        self._db = sqlite3.connect(os.path.join(CACHE, "connections.sqlite"), check_same_thread=False)
+    def __init__(self, stats_dir, cache_root=None):
+        self.model_id = MODEL
+        self.revision = MODEL_REVISION
+        self.cache_root = os.path.abspath(cache_root or CACHE)
+        self.cache_namespace = model_cache_namespace(self.model_id, self.revision)
+        self.cache_dir = os.path.join(self.cache_root, self.cache_namespace)
+        self.stats_root = os.path.abspath(stats_dir)
+        self.stats_dir = os.path.join(self.stats_root, self.cache_namespace)
+        self.family = infer_model_family(self.model_id)
+        self.config_metadata = cached_config_metadata(self.model_id, self.revision)
+        self.requested_device = os.environ.get("EXPLORER_DEVICE")
+        self.dev = resolve_device(self.requested_device)
+        self._allow_legacy_qwen_cache = (
+            self.model_id == "Qwen/Qwen3.5-4B" and self.revision is None
+        )
+        os.makedirs(self.cache_dir, exist_ok=True)
+        os.makedirs(self.stats_dir, exist_ok=True)
+        self._db = sqlite3.connect(os.path.join(self.cache_dir, "connections.sqlite"), check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS con (key TEXT PRIMARY KEY, val TEXT)")
         self._db_lock = threading.Lock()
         self._lens_idx = None
         self._con_idx = None
         self.lock = threading.Lock()
         self.model = self.tok = None
+        self.adapter: ModelAdapter | None = None
+        self.lm = None
+        self._hook_handles = []
         self.status = "idle"
         self.resid_p50 = {}
         self._push = None  # [(layer, neuron, mode, per-row values tensor)], any number of neurons at once (neuron None = all)
@@ -50,6 +92,67 @@ class Runtime:
         self._capture_full = None
         self._lens_cache = {}
 
+    @property
+    def model_info(self):
+        """JSON-safe model identity available before weights are loaded."""
+        info = {
+            "model_id": self.model_id,
+            "revision": self.revision,
+            "family": self.adapter.family if self.adapter else self.family,
+            "cache_namespace": self.cache_namespace,
+            "cache_root": self.cache_root,
+            "cache_dir": self.cache_dir,
+            "stats_root": self.stats_root,
+            "stats_dir": self.stats_dir,
+            "config": self.adapter.config_metadata if self.adapter else self.config_metadata,
+        }
+        if self.adapter:
+            info["model_prefix"] = self.adapter.model_prefix
+            info["device"] = str(self.adapter.device)
+        else:
+            info["device"] = str(self.dev)
+        return info
+
+    def get_model_info(self):
+        return self.model_info
+
+    def _cache_path(self, filename, allow_legacy=True):
+        path = os.path.join(self.cache_dir, filename)
+        if os.path.exists(path):
+            return path
+        legacy = os.path.join(self.cache_root, filename)
+        if allow_legacy and self._allow_legacy_qwen_cache and os.path.exists(legacy):
+            return legacy
+        return path
+
+    def _attach_model(self, model, tokenizer, adapter, device):
+        """Attach decoder hooks and preserve the model aliases used by the app."""
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles.clear()
+        self.model, self.tok, self.adapter = model, tokenizer, adapter
+        self.lm, self.dev = adapter.language_model, torch.device(device)
+        try:
+            for i, layer in enumerate(adapter.layers):
+                mlp = getattr(layer, "mlp", None)
+                down_proj = getattr(mlp, "down_proj", None)
+                if down_proj is None:
+                    raise ValueError(f"Model layer {i} does not expose an MLP down_proj")
+                self._hook_handles.append(down_proj.register_forward_pre_hook(self._hook(i)))
+                self._hook_handles.append(layer.register_forward_hook(self._resid_hook(i)))
+                attention = adapter.attention_projection(i)
+                if attention is not None:
+                    projection, n_heads = attention
+                    self._hook_handles.append(projection.register_forward_pre_hook(self._head_hook(i, n_heads)))
+        except Exception:
+            for handle in self._hook_handles:
+                handle.remove()
+            self._hook_handles.clear()
+            raise
+        self.family = adapter.family
+        self.cache_namespace = adapter.cache_namespace
+        self.config_metadata = adapter.config_metadata
+
     # ---------- loading ----------
     def ensure_loaded(self):
         if self.model is not None:
@@ -60,22 +163,29 @@ class Runtime:
             if self.model is not None:
                 return
             self.status = "loading"
-            dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-            self.tok = AutoTokenizer.from_pretrained(MODEL)
-            m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
-            self.dev, self.model, self.lm = dev, m, m.model.language_model
-            for i, layer in enumerate(self.lm.layers):
-                layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
-                layer.register_forward_hook(self._resid_hook(i))
-                # attention output projection: its input is the heads side by side (full attention: o_proj, 16 x 256
-                # after the output gate; linear attention: out_proj, 32 value heads x 128 after the gated norm)
-                if hasattr(layer, "self_attn"):
-                    a = layer.self_attn
-                    a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
-                else:
-                    a = layer.linear_attn
-                    a.out_proj.register_forward_pre_hook(self._head_hook(i, a.num_v_heads))
-            self.status = "ready"
+            try:
+                model, tokenizer, adapter = load_model_and_tokenizer(
+                    self.model_id,
+                    revision=self.revision,
+                    device=self.requested_device,
+                )
+                self._attach_model(model, tokenizer, adapter, adapter.device)
+                self.status = "ready"
+            except Exception:
+                self.status = "error"
+                raise
+
+    def close(self):
+        """Remove installed hooks and close the runtime's SQLite cache."""
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles.clear()
+        self._push = self._heads = self._read = None
+        self._capture_all = self._capture_full = None
+        if getattr(self, "_db", None) is not None:
+            self._db.close()
+            self._db = None
+        self.status = "closed"
 
     def _hook(self, i):
         def hook(mod, inp):
@@ -119,8 +229,8 @@ class Runtime:
         return hook
 
     def n_heads(self, layer):
-        L = self.lm.layers[layer]
-        return L.self_attn.o_proj.in_features // L.self_attn.head_dim if hasattr(L, "self_attn") else L.linear_attn.num_v_heads
+        attention = self.adapter.attention_projection(layer)
+        return attention[1] if attention is not None else 0
 
     def _resid_hook(self, i):
         def hook(mod, inp, out):
@@ -132,20 +242,32 @@ class Runtime:
     def layer_resid_p50(self, layer):
         if layer in self.resid_p50:
             return self.resid_p50[layer]
-        path = os.path.join(self.stats_dir, f"q35-4b_L{layer}.npz")
-        if os.path.exists(path):
+        candidates = [
+            os.path.join(self.stats_dir, f"model_L{layer}.npz"),
+            os.path.join(self.stats_dir, f"layer-{layer}.npz"),
+            os.path.join(self.stats_dir, f"layer_{layer}.npz"),
+        ]
+        if self._allow_legacy_qwen_cache:
+            candidates.insert(0, os.path.join(self.stats_dir, f"q35-4b_L{layer}.npz"))
+            candidates.append(os.path.join(self.stats_root, f"q35-4b_L{layer}.npz"))
+        path = next((p for p in candidates if os.path.exists(p)), None)
+        if path is not None:
             v = float(np.load(path)["resid_norm_q10_50_90"][1])
         else:
             ids = self.tok(REFERENCE_TEXT, return_tensors="pt").input_ids.to(self.dev)
             self._seen["want_resid"] = layer
-            with torch.inference_mode():
-                self.lm(input_ids=ids, use_cache=False)
-            self._seen.pop("want_resid")
+            try:
+                with torch.inference_mode():
+                    self.lm(input_ids=ids, use_cache=False)
+            finally:
+                self._seen.pop("want_resid", None)
             v = float(self._seen.pop("resid").median())
         self.resid_p50[layer] = v
         return v
 
     def down_col(self, layer, n):
+        if self.adapter is not None:
+            return self.adapter.down_col(layer, n).float()
         return self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
 
     # ---------- steering ----------
@@ -153,7 +275,10 @@ class Runtime:
         return self.messages_ids([{"role": "user", "content": prompt}])
 
     def messages_ids(self, messages):
-        enc = self.tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False, tokenize=True)
+        self.ensure_loaded()
+        if self.adapter is not None:
+            return self.adapter.apply_chat_template(messages)
+        enc = self.tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
         return list(enc["input_ids"] if hasattr(enc, "keys") else enc)
 
     def steer_stream(self, layer, n, rows_messages, dose, mode, max_new=200, cancel=None):
@@ -174,25 +299,24 @@ class Runtime:
                 push = [self._push_entry(layer, n, dose, mode, (1, 0, -1)) for layer, n, dose, mode in pushes]
                 seqs = [self.messages_ids(m) for m in rows_messages]
                 T = max(map(len, seqs))
-                pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
+                pad = self.adapter.pad_token_id
                 ids = torch.tensor([[pad] * (T - len(q)) + q for q in seqs], device=self.dev)
                 mask = torch.tensor([[0] * (T - len(q)) + [1] * len(q) for q in seqs], device=self.dev)
                 pos = (mask.cumsum(-1) - 1).clamp(min=0)
-                eos = self.tok.convert_tokens_to_ids("<|im_end|>")
                 done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
                 self._push = push
                 with torch.inference_mode():
                     out = self.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=True,
-                                     logits_to_keep=1)
+                                     **self.adapter.logits_to_keep_kwargs())
                     for _ in range(max_new):
                         if cancel is not None and cancel.is_set():
                             break
-                        nxt = out.logits[:, -1].argmax(-1)
+                        nxt = self.adapter.logits(out)[:, -1].argmax(-1)
                         for r in range(3):
                             if done[r]:
                                 continue
                             t = int(nxt[r])
-                            if t == eos:
+                            if self.adapter.is_eos_token(t):
                                 done[r] = True
                                 continue
                             out_ids[r].append(t)
@@ -205,7 +329,8 @@ class Runtime:
                         mask = torch.cat([mask, torch.ones_like(mask[:, :1])], -1)
                         pos = pos[:, -1:] + 1
                         out = self.model(input_ids=nxt[:, None], attention_mask=mask, position_ids=pos,
-                                         past_key_values=out.past_key_values, use_cache=True, logits_to_keep=1)
+                                         past_key_values=out.past_key_values, use_cache=True,
+                                         **self.adapter.logits_to_keep_kwargs())
             finally:
                 self._push = None
         yield None, None
@@ -269,9 +394,9 @@ class Runtime:
                 self._heads = None
             act = self._seen.pop("act").tolist()
         units = []
-        for text, idx in self.token_units(ids):
+        for unit_text, idx in self.token_units(ids):
             vals = [act[i] for i in idx]
-            units.append({"text": text, "act": max(vals, key=abs), "pieces": vals})
+            units.append({"text": unit_text, "act": max(vals, key=abs), "pieces": vals})
         return {"units": units}
 
     def next_logprobs(self, text, chat=True, prefix="", pushes=None, heads=None):
@@ -288,10 +413,14 @@ class Runtime:
                 self._push, self._heads = push, hd
                 try:
                     with torch.inference_mode():
-                        out = self.model(input_ids=torch.tensor([ids], device=self.dev), use_cache=False, logits_to_keep=1)
+                        out = self.model(
+                            input_ids=torch.tensor([ids], device=self.dev),
+                            use_cache=False,
+                            **self.adapter.logits_to_keep_kwargs(),
+                        )
                 finally:
                     self._push = self._heads = None
-                return torch.log_softmax(out.logits[0, -1].float(), -1).cpu()
+                return torch.log_softmax(self.adapter.logits(out)[0, -1].float(), -1).cpu()
 
         base = run(None, None)
         if not pushes and not heads:
@@ -302,7 +431,7 @@ class Runtime:
     def con_index(self):
         """Precomputed connections (build_connections.py), loaded once."""
         if self._con_idx is None:
-            path = os.path.join(CACHE, "connections.npz")
+            path = self._cache_path("connections.npz")
             if os.path.exists(path):
                 z = np.load(path)
                 self._con_idx = {key: z[key] for key in z.files}
@@ -314,7 +443,7 @@ class Runtime:
     # ---------- logit lens ----------
     def lens_index(self):
         if self._lens_idx is None:
-            path = os.path.join(CACHE, "lens_index.npz")
+            path = self._cache_path("lens_index.npz")
             if os.path.exists(path):
                 z = np.load(path)
                 self._lens_idx = {"up": z["up"], "down": z["down"]}
@@ -322,7 +451,7 @@ class Runtime:
 
     def steer_index(self):
         if getattr(self, "_steer_idx", None) is None:
-            path = os.path.join(CACHE, "steer_index.npz")
+            path = self._cache_path("steer_index.npz")
             self._steer_idx = dict(np.load(path)) if os.path.exists(path) else False
         return self._steer_idx or None
 
@@ -343,7 +472,7 @@ class Runtime:
             d = self.down_col(layer, n).to(self.model.dtype)[None, None]
             out = {}
             for sign, name in ((1, "up"), (-1, "down")):
-                logits = self.model.lm_head(self.lm.norm(sign * d))[0, 0].float()
+                logits = self.adapter.lm_head(self.adapter.norm(sign * d))[0, 0].float()
                 top = logits.topk(k).indices.tolist()
                 out[name] = [self.tok.decode([t]) for t in top]
         self._lens_cache[(layer, n, k)] = out
@@ -352,8 +481,8 @@ class Runtime:
     # ---------- connections ----------
     def connections(self, layer, n, k=24, lens_k=5):
         """Direct-path weights between neuron (layer, n) and neurons in other layers, ignoring everything between.
-        Downstream B in layer j > layer: g = W_gate_j[B] . ((1 + w_j) * d_n), u = W_up_j[B] . (...), where d_n is this
-        neuron's down column and w_j the pre-MLP norm weight. Upstream A in layer i < layer: the same with A's down
+        Downstream B in layer j > layer: g = W_gate_j[B] . (s_j * d_n), u = W_up_j[B] . (...), where d_n is this
+        neuron's down column and s_j the actual pre-MLP norm scale. Upstream A in layer i < layer: the same with A's down
         column against this neuron's gate and up rows. Score = |g * u| z-scored within each layer; sign = sign(g * u).
         Each returned neuron carries its own logit-lens tokens."""
         key = (layer, n, k, lens_k)
@@ -391,14 +520,14 @@ class Runtime:
             out = {"down": [], "up": []}
             d = self.lm.layers[layer].mlp.down_proj.weight[:, n]
             me = self.lm.layers[layer]
-            scale_me = (1.0 + me.post_attention_layernorm.weight.float()).to(dt)
+            scale_me = self.adapter.layer_norm_scale(layer).to(dt)
             r_g = me.mlp.gate_proj.weight[n] * scale_me
             r_u = me.mlp.up_proj.weight[n] * scale_me
             for j, Lyr in enumerate(self.lm.layers):
                 if j == layer:
                     continue
                 if j > layer:
-                    v = d * (1.0 + Lyr.post_attention_layernorm.weight.float()).to(dt)
+                    v = d * self.adapter.layer_norm_scale(j).to(dt)
                     g, u = (Lyr.mlp.gate_proj.weight @ v).float(), (Lyr.mlp.up_proj.weight @ v).float()
                     side = "down"
                 else:
@@ -422,7 +551,7 @@ class Runtime:
                     c["lens_neg"] = [v[t] for t in idx["down"][c["layer"], c["n"], :lens_k]]
             elif every and lens_k:
                 D = torch.stack([self.lm.layers[c["layer"]].mlp.down_proj.weight[:, c["n"]] for c in every])
-                logits = self.model.lm_head(self.lm.norm(D[:, None]))[:, 0].float()
+                logits = self.adapter.lm_head(self.adapter.norm(D[:, None]))[:, 0].float()
                 ids, ids_neg = logits.topk(lens_k).indices.tolist(), (-logits).topk(lens_k).indices.tolist()
                 for c, row, row_neg in zip(every, ids, ids_neg):
                     c["lens"] = [self.tok.decode([t]) for t in row]
@@ -449,7 +578,7 @@ class Runtime:
                 W = layer.mlp.down_proj.weight  # [hidden, inter]
                 for s in range(0, N, chunk):
                     D = W[:, s:s + chunk].T[:, None]  # [c, 1, hidden]
-                    logits = self.model.lm_head(self.lm.norm(D))[:, 0]
+                    logits = self.adapter.lm_head(self.adapter.norm(D))[:, 0]
                     up[li, s:s + chunk] = logits.topk(k).indices.cpu().numpy()
                     down[li, s:s + chunk] = (-logits).topk(k).indices.cpu().numpy()
         np.savez(path, up=up, down=down)
@@ -458,14 +587,22 @@ class Runtime:
 
     def vocab_strings(self):
         if getattr(self, "_vocab", None) is None:
-            path = os.path.join(CACHE, "vocab.json")
+            path = self._cache_path("vocab.json")
             if os.path.exists(path):
-                self._vocab = json.load(open(path))
+                with open(path) as f:
+                    self._vocab = json.load(f)
             else:
                 if self.tok is None:
-                    self.tok = AutoTokenizer.from_pretrained(MODEL)
+                    if NO_MODEL:
+                        raise RuntimeError("no cached vocabulary available while EXPLORER_NO_MODEL is set")
+                    self.tok = AutoTokenizer.from_pretrained(
+                        self.model_id,
+                        revision=self.revision,
+                        local_files_only=True,
+                    )
                 self._vocab = [self.tok.decode([i]) for i in range(len(self.tok))]
-                json.dump(self._vocab, open(path, "w"))
+                with open(path, "w") as f:
+                    json.dump(self._vocab, f)
         return self._vocab
 
     # ---------- which neurons fire on a text ----------

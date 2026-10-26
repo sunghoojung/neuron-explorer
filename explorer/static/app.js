@@ -1,4 +1,4 @@
-import { createMap } from "./map3d.js?v=69";
+import { createMap } from "./map3d.js?v=70";
 import { createScatter } from "./scatter.js?v=39";
 
 const $ = s => document.querySelector(s);
@@ -11,17 +11,33 @@ addEventListener("unhandledrejection", e => { const el = document.querySelector(
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmtDose = d => (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d);
 
-let agentSelecting = false, agentMarked = false;  // Claude's selections and marks (see agentUi); declared early, openNeuron reads them on load
+let agentSelecting = false, agentMarked = false;  // ChatGPT's selections and marks (see agentUi); declared early, openNeuron reads them on load
 const state = { layer: null, units: {}, unitMap: {}, focus: null, view: "map", chat: { mode: "add", dir: "writes", dose: { add: 0.8, mul: 2 } } };
 const ADD_STEPS = [...Array.from({ length: 30 }, (_, i) => +((i + 1) * 0.05).toFixed(2)), 1.75, 2, 2.5, 3, 4, 5];
 const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12, 16];
 
 const index = await api("/api/index");
 const arch = index.arch;
+const modelInfo = index.model_info || { id: index.model };
+const modelId = modelInfo.id || index.model || "Model";
+const modelRevision = modelInfo.revision;
+$("#model-id").textContent = modelId;
+$("#model-id").title = `${modelId}${modelRevision ? ` · revision ${modelRevision}` : ""}`;
+document.title = `${modelId} - Neuron Explorer`;
 const tip = $("#tip");
 
+function emptyMap() {
+  return {
+    layerMode: null,
+    debug: () => ({}),
+    setUnits() {}, select() {}, setConnections() {}, setHoverConnections() {}, setLayout() {}, setWeb() {},
+    setMarks() {}, setInsets() {}, hover() {}, enterLayer() {}, exitLayer() {}, viewLayer() {}, setNotes() {},
+    focusNeuron() {}, flyToNeuron() {}, home() {},
+  };
+}
+
 // ---------- map ----------
-const map = createMap($("#map"), $("#layer-labels"), arch, {
+const map = arch ? createMap($("#map"), $("#layer-labels"), arch, {
   onPick: (layer, n) => openNeuron(layer, n, "neuron", true, false),
   onLayerMode: l => {
     $("#layer-back").classList.toggle("on", l !== null);
@@ -56,7 +72,7 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
     }, 120);
     hoverKey = key;
   },
-});
+}) : emptyMap();
 function showTip(x, y, head, body) { showTipHTML(x, y, head, esc(body)); }
 function showTipHTML(x, y, head, html) {
   tip.innerHTML = `<div class="lab">${esc(head)}</div>${html}`;
@@ -80,6 +96,7 @@ let wantLayout = null;
 async function setLayout(kind) {
   wantLayout = kind;
   document.querySelectorAll("#layout-mode button").forEach(b => b.classList.toggle("on", b.dataset.k === kind));
+  if (!arch) return;
   if (kind === "index") { map.setLayout(null); return; }
   if (!layouts[kind]) {
     const r = await api(`/api/layout?kind=${kind}`);
@@ -101,7 +118,7 @@ async function refreshWeb() {
   const f = state.focus, first = Math.max(1, Math.min(24, Math.round(Number($("#web-z").value) || 5)));
   const k = Number(new URLSearchParams(location.search).get("webk")) || 2;
   const hops = Number(new URLSearchParams(location.search).get("webhops")) || 0;  // hops out each way; 0 = all the way
-  if (!webOn || !f || f.kind !== "neuron") { webKey = null; state.webSum = null; map.setWeb(null); renderList(); return; }
+  if (!arch || !webOn || !f || f.kind !== "neuron") { webKey = null; state.webSum = null; map.setWeb(null); renderList(); return; }
   const key = `${f.layer}/${f.n}/${first}/${k}/${hops}`;
   if (key === webKey) return;
   webKey = key;
@@ -149,17 +166,22 @@ function setView(v) {
   if (v === "embed") loadEmbeddings();
 }
 const layerSel = $("#layer");
-for (let l = 0; l < arch.n_layers; l++) {
+for (let l = 0; arch && l < arch.n_layers; l++) {
   const o = document.createElement("option"); o.value = l;
   o.textContent = `L${l}${index.layers[l] ? "" : " ·"}`;
   layerSel.appendChild(o);
 }
+layerSel.disabled = !arch;
+$("#inf-hi").value = arch ? arch.n_layers - 1 : 0;
+for (const selector of ["#jump", "#web-z", "#lens-q", "#inf-text"]) $(selector).disabled = !arch;
+document.querySelectorAll("#q-mode button, #web-mode button, #layout-mode button").forEach(button => { button.disabled = !arch; });
 layerSel.onchange = () => { setLayer(+layerSel.value); map.enterLayer(+layerSel.value); };
 
 async function setLayer(l) {
+  if (!arch) return;
   state.layer = l; layerSel.value = l;
   if (scatter.data && scatter.data.layer !== l) { scatter.setData(null); hideTip(); }
-  try { localStorage.setItem("ne.layer", l); } catch {}
+  try { localStorage.setItem(`ne.layer:${modelInfo.cache_namespace || modelId}`, l); } catch {}
   if (!state.units[l]) {
     if (!lensResults) $("#rows").innerHTML = `<li class="head">…</li>`;
     const us = index.layers[l] ? await api(`/api/units?layer=${l}`) : [];
@@ -173,6 +195,7 @@ async function setLayer(l) {
 }
 async function loadEmbeddings() {
   const l = state.layer;
+  if (l == null) { $("#embed-empty").textContent = "Model configuration is unavailable."; scatter.setData(null); return; }
   $("#embed-empty").textContent = "…";
   const d = index.layers[l] ? await api(`/api/embeddings?layer=${l}`) : {};
   if (state.layer !== l) return;
@@ -192,7 +215,7 @@ function showLeft(t) {
   $(`#ltabs button[data-lt="${t}"]`).classList.remove("fresh");
   syncLeftMap();
 }
-// a tab whose contents changed while hidden (Claude ran text, or searched) gets a dot until opened
+// a tab whose contents changed while hidden (ChatGPT ran text, or searched) gets a dot until opened
 function markLeftFresh(t) { if (t !== leftTab) $(`#ltabs button[data-lt="${t}"]`).classList.add("fresh"); }
 // the map shows what the open tab shows: lens hits and the open neuron's web on net, what fired on run
 function syncLeftMap() {
@@ -332,9 +355,10 @@ $("#show-random").onchange = renderList;
 function webSummaryHTML() {
   const w = state.webSum, f = state.focus;
   if (!w || !f || f.kind !== "neuron" || w.layer !== f.layer || w.n !== f.n) return "";
+  if (w.ready === false) return `<div class="head">Weight-only candidate links are leads, not causal evidence. Lens data for this summary is not available.</div>`;
   const chips = list => list.length ? list.map(t => `<span class="chip" data-q="${esc(t.tok)}" title="${t.n} neurons · score ${t.w}">${esc(t.tok)}<i>${t.n}</i></span>`).join("")
     : `<span class="faint">nothing above chance</span>`;
-  return `<div class="head">web of L${w.layer} N${w.n} · ${w.links} links · ${w.src} lens, ranked by lift over each layer</div>
+  return `<div class="head">weight-only candidate links for L${w.layer} N${w.n} · ${w.links} links · ${w.src} lens, ranked by lift</div>
     <div class="wsum"><div class="lab"><span class="sw up"></span>fed by · ${w.up.neurons} upstream neurons</div><div class="chips">${chips(w.up.fed_by)}</div></div>
     <div class="wsum"><div class="lab"><span class="sw down"></span>held back by</div><div class="chips">${chips(w.up.held_by || [])}</div></div>
     <div class="wsum"><div class="lab"><span class="sw up"></span>feeds → pushes toward · ${w.down.neurons} downstream neurons</div><div class="chips">${chips(w.down.toward)}</div></div>
@@ -352,6 +376,7 @@ function lensHTML() {
 }
 function renderList() {
   $("#net").innerHTML = lensHTML() + webSummaryHTML();
+  if (!arch) { $("#rows").innerHTML = '<li class="head">Model configuration is not available locally.</li>'; return; }
   if (lensResults) return renderResults(lensResults, $("#rows"));
   const q = $("#filter").value.trim().toLowerCase(), showR = $("#show-random").checked;
   const units = (state.units[state.layer] || []).filter(u => (showR || u.kind === "neuron") &&
@@ -359,9 +384,10 @@ function renderList() {
   const rnd = (state.units[state.layer] || []).filter(u => u.kind === "random").map(u => u.z);
   const floor = rnd.length ? Math.max(...rnd) : -Infinity;
   const ol = $("#rows");
-  ol.innerHTML = units.slice(0, 600).map(u => `<li data-n="${u.n}" data-kind="${u.kind}" class="${u.kind}${u.z <= floor ? " below" : ""}${state.focus && state.focus.n === u.n && state.focus.layer === state.layer && u.kind === "neuron" ? " sel" : ""}">
+  ol.innerHTML = units.length ? units.slice(0, 600).map(u => `<li data-n="${u.n}" data-kind="${u.kind}" class="${u.kind}${u.z <= floor ? " below" : ""}${state.focus && state.focus.n === u.n && state.focus.layer === state.layer && u.kind === "neuron" ? " sel" : ""}">
     <span class="n">${u.kind === "random" ? "r" : "N"}${u.n}</span><span class="z">${u.z.toFixed(1)}</span>
-    <span class="w">${u.name ? `<b>${esc(u.name)}</b> ` : ""}${esc(u.words.join(" "))}</span></li>`).join("");
+    <span class="w">${u.name ? `<b>${esc(u.name)}</b> ` : ""}${esc(u.words.join(" "))}</span></li>`).join("")
+    : `<li class="head">No sweep data for this model revision.</li>`;
 }
 // lens hits (net tab) or what fired (run tab)
 function renderResults(r, ol) {
@@ -418,23 +444,23 @@ function setFocusCollapsed(c) {
   focusEl.classList.toggle("collapsed", c);
   syncEdge(); updateInsets();
 }
-// the right edge handle: brings back a collapsed panel, or opens Claude when no panel is up
+// the right edge handle: brings back a collapsed panel, or opens ChatGPT when no panel is up
 function syncEdge() {
   const on = focusEl.classList.contains("on"), col = focusEl.classList.contains("collapsed"), f = state.focus;
   const t = $("#focus-tab");
   t.classList.toggle("on", !on || col);
-  t.textContent = on && col && f ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ claude";
+  t.textContent = on && col && f ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ ChatGPT";
 }
 $("#list-hide").onclick = () => setListHidden(true);
 $("#list-tab").onclick = () => setListHidden(false);
 $("#f-collapse").onclick = () => setFocusCollapsed(true);
-$("#focus-tab").onclick = () => focusEl.classList.contains("on") ? setFocusCollapsed(false) : openClaude();
+$("#focus-tab").onclick = () => focusEl.classList.contains("on") ? setFocusCollapsed(false) : openChatGPT();
 
 // ---------- focus panel ----------
 const focusEl = $("#focus");
-// closing the neuron keeps the panel up when Claude is the open tab
+// closing the neuron keeps the panel up when ChatGPT is the open tab
 $("#f-close").onclick = () => { flushName(); if (running) running.abort(); state.focus = null; $("#list").classList.remove("has-focus");
-  if (curTab() === "claude") syncTabs(); else focusEl.classList.remove("on");
+  if (curTab() === "chatgpt") syncTabs(); else focusEl.classList.remove("on");
   setFocusCollapsed(false); map.select(null); refreshWeb(); renderAgentActions(); scatter.select(null, null); history.replaceState(null, "", " "); renderList(); };
 document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => setTab(b.dataset.tab));
 const tabBtn = t => $(`#tabs button[data-tab="${t}"]`);
@@ -442,21 +468,21 @@ const curTab = () => $("#tabs button.on")?.dataset.tab;
 function setTab(t) {
   document.querySelectorAll("#tabs button[data-tab]").forEach(x => x.classList.toggle("on", x.dataset.tab === t));
   document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x.id === `tab-${t}`));
-  focusEl.classList.toggle("on-claude", t === "claude");
+  focusEl.classList.toggle("on-chatgpt", t === "chatgpt");
   tabBtn(t).classList.remove("fresh");
-  if (t === "claude") { const th = $("#a-thread"); th.scrollTop = th.scrollHeight; }
+  if (t === "chatgpt") { const th = $("#a-thread"); th.scrollTop = th.scrollHeight; }
 }
 // a tab that changed while another was showing gets a dot until opened
 function markFresh(t) { if (curTab() !== t) tabBtn(t).classList.add("fresh"); }
-// neuron tabs show while a neuron is open (Chat for real neurons only); Claude always
+// neuron tabs show while a neuron is open (Chat for real neurons only); ChatGPT always
 function syncTabs() {
   const f = state.focus;
   for (const t of ["examples", "details"]) tabBtn(t).style.display = f ? "" : "none";
   tabBtn("chat").style.display = f && f.kind === "neuron" ? "" : "none";
-  if (tabBtn(curTab()).style.display === "none") setTab(f ? "examples" : "claude");
+  if (tabBtn(curTab()).style.display === "none") setTab(f ? "examples" : "chatgpt");
 }
-function openClaude() {
-  focusEl.classList.add("on"); syncTabs(); setTab("claude"); setFocusCollapsed(false); $("#a-input").focus();
+function openChatGPT() {
+  focusEl.classList.add("on"); syncTabs(); setTab("chatgpt"); setFocusCollapsed(false); $("#a-input").focus();
 }
 
 async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
@@ -545,9 +571,11 @@ async function loadLive(layer, n) {
   if (!isFocus(layer, n, "neuron")) return;
   conP.then(con => {
     if (!isFocus(layer, n, "neuron")) return;
+    if (!con.ready && con.reason) { $("#d-con").textContent = con.reason; return; }
     map.setConnections(con); state.con = con; renderConnections();
   }, err => { if (isFocus(layer, n, "neuron") && $("#d-con")) $("#d-con").textContent = err.message; });
   if (!lens) return;
+  if (lens.ready === false) { if ($("#d-lens")) $("#d-lens").textContent = lens.reason || "Live lens data is unavailable."; return; }
   state.lens = { ...lens, layer, n }; renderList();
   const tok = t => `<span class="tok">${esc(t)}</span>`;
   const steer = lens.steer_up ? `<div class="lab">steer lens</div><div class="lens"><div class="up"><div class="lab">+ push · KL ${lens.kl_up}</div>${lens.steer_up.map(tok).join("")}</div><div class="down"><div class="lab">− push · KL ${lens.kl_down}</div>${lens.steer_down.map(tok).join("")}</div></div><div class="lab" style="margin-top:14px">logit lens</div>` : "";
@@ -718,7 +746,14 @@ async function pollStatus() {
   try {
     const s = await api("/api/status");
     state.statusText = s.status;
-    $("#status").textContent = s.status === "ready" ? "" : s.status;
+    const notes = [];
+    if (s.status !== "ready") notes.push(s.status);
+    if (s.model?.device && s.model.device !== "not loaded") notes.push(s.model.device);
+    if (!s.arch) notes.push("config unavailable");
+    if (!s.has_runs) notes.push("no sweeps");
+    if (Object.values(s.cache || {}).every(available => !available)) notes.push("no caches");
+    $("#status").textContent = notes.join(" · ");
+    $("#status").title = $("#status").textContent;
     if (s.status === "ready" && lensResults && !lensResults.ready) runLensSearch();
     setTimeout(pollStatus, s.status === "ready" ? 8000 : 2000);
   } catch {
@@ -731,14 +766,14 @@ pollStatus();
 window.__ne = { map, state, scatter };
 // ---------- start ----------
 const have = Object.keys(index.layers).map(Number);
-let saved = null; try { const v = localStorage.getItem("ne.layer"); if (v !== null) saved = +v; } catch {}
+let saved = null; try { const v = localStorage.getItem(`ne.layer:${modelInfo.cache_namespace || modelId}`); if (v !== null) saved = +v; } catch {}
 const first = have.includes(saved) ? saved : have.includes(22) ? 22 : (have[0] ?? 0);
-await setLayer(first);
-if (location.hash) fromHash();
+if (arch) await setLayer(first);
+if (arch && location.hash) fromHash();
 
-// ---------- claude: the Claude tab, one claude -p session per conversation ----------
-const agent = { chat: null, ctl: null };
-const agentEl = $("#tab-claude");
+// ---------- ChatGPT: the cloud-backed conversation tab ----------
+const agent = { chat: null, ctl: null, flushAfterStop: false };
+const agentEl = $("#tab-chatgpt");
 function mdInline(t) {
   return esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
     .replace(/\bL(\d{1,2})[ \/]N(\d{1,4})\b/g, (m, l, n) => `<a class="nref" data-l="${l}" data-n="${n}">${m}</a>`);
@@ -756,16 +791,41 @@ function md(src) {
   return out.join("");
 }
 const EMPTY = `<div class="a-empty dim">Ask anything about the model, or open a neuron and press <b>explain</b>.</div>`;
-// the conversation persists in this browser: chat id (= claude session, resumed server side) and the rendered thread
-const AGENT_KEY = "explorer.agent";
+// conversation history is app-local and model-scoped; this browser stores its ID and rendered thread
+const AGENT_KEY = `explorer.chatgpt:${modelInfo.cache_namespace || modelId}`;
 function saveAgent() {
-  try { localStorage.setItem(AGENT_KEY, JSON.stringify({ chat: agent.chat, html: $("#a-thread").innerHTML })); } catch {}
+  try {
+    localStorage.setItem(AGENT_KEY, JSON.stringify({
+      chat: agent.chat,
+      html: $("#a-thread").innerHTML,
+      queue: (agent.queue || []).map(({ msg, atts }) => ({ msg, atts })),
+      pending: (agent.pending || []).map(({ name, id }) => ({ name, id })),
+      draft: $("#a-input").value,
+    }));
+  } catch {}
+}
+let agentSaveTimer = null;
+function scheduleSaveAgent() {
+  clearTimeout(agentSaveTimer);
+  agentSaveTimer = setTimeout(() => { agentSaveTimer = null; saveAgent(); }, 200);
 }
 function loadAgent() {
   try {
     const v = JSON.parse(localStorage.getItem(AGENT_KEY) || "null"); if (!v) return;
     agent.chat = v.chat; $("#a-thread").innerHTML = v.html || EMPTY;
     $("#a-thread").querySelectorAll("#a-usename, .a-msg.queued, .a-busy").forEach(b => b.remove());
+    agent.queue = Array.isArray(v.queue) ? v.queue.filter(q => q && typeof q.msg === "string").map(q => ({
+      msg: q.msg,
+      atts: Array.isArray(q.atts) ? q.atts.filter(a => a && typeof a.id === "string") : [],
+    })) : [];
+    agent.pending = Array.isArray(v.pending) ? v.pending.filter(a => a && typeof a.name === "string").map(a => ({
+      name: a.name,
+      id: typeof a.id === "string" ? a.id : null,
+    })) : [];
+    $("#a-input").value = typeof v.draft === "string" ? v.draft : "";
+    for (const queued of agent.queue) renderQueuedMessage(queued);
+    renderPending();
+    growInput();
     $("#a-thread").scrollTop = $("#a-thread").scrollHeight;
     addTurnControls();
   } catch {}
@@ -773,23 +833,27 @@ function loadAgent() {
 // quick actions above the input, for the open neuron
 function renderAgentActions() {
   const f = state.focus;
-  $("#a-actions").innerHTML = f && f.kind === "neuron" ? `<button data-a="explain">explain L${f.layer} N${f.n}</button><button data-a="web">what does its web do?</button>` : "";
+  $("#a-actions").innerHTML = f && f.kind === "neuron" ? `<button data-a="explain">explain L${f.layer} N${f.n}</button><button data-a="web">inspect weight links</button>` : "";
 }
 $("#a-actions").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b || agent.ctl) return;
   if (b.dataset.a === "explain") explainFocus();
-  else if (b.dataset.a === "web") { const f = state.focus; agentTurn(`Look at the cone of L${f.layer} N${f.n} (what it reads from and writes into, a few hops out) and tell me briefly what that circuit seems to do. Highlight the neurons you mention.`, `what does the web of L${f.layer} N${f.n} do?`); }
+  else if (b.dataset.a === "web") { const f = state.focus; agentTurn(`Review the weight-only candidate links around L${f.layer} N${f.n}. They are hypotheses, not causal evidence. Describe patterns cautiously and say that interventions are needed to test causal influence. Highlight the neurons you mention.`, `inspect weight links for L${f.layer} N${f.n}`); }
 });
 function resetAgent() {
   if (agent.ctl) agent.ctl.abort();
+  agent.queue = [];
+  agent.pending = [];
+  agent.flushAfterStop = false;
   agent.chat = null; $("#a-thread").innerHTML = EMPTY;
+  renderPending();
   saveAgent();
 }
 agentEl.addEventListener("click", e => {
   const a = e.target.closest("a.nref"); if (a) goToNeuron(+a.dataset.l, +a.dataset.n);
 });
-// what Claude does to the screen (see agent_mcp.py)
-// Claude's labels and highlights last until its next reply, or until the person opens a neuron themselves
+// what ChatGPT does to the screen (see agent_mcp.py)
+// ChatGPT's labels and highlights last until its next reply, or until the person opens a neuron themselves
 function clearAgentMarks() {
   map.setNotes([]);
   if (agentMarked) { agentMarked = false; syncLeftMap(); }
@@ -813,7 +877,7 @@ async function agentUi(e) {
     if (e.mode === "home") map.home();
     else if (e.mode === "layer") map.viewLayer(e.layer);
     else if (e.mode === "neuron") map.flyToNeuron(e.layer, e.n, e.closeness || 0.22);
-  } else if (e.action === "tab") { if (state.focus && tabBtn(e.tab)) { if (curTab() === "claude") markFresh(e.tab); else setTab(e.tab); } }
+  } else if (e.action === "tab") { if (state.focus && tabBtn(e.tab)) { if (curTab() === "chatgpt") markFresh(e.tab); else setTab(e.tab); } }
   else if (e.action === "search") {
     if (state.qMode !== "lens") $('#q-mode button[data-q="lens"]').click();
     $("#lens-q").value = e.query; $("#lens-q").dispatchEvent(new Event("input"));
@@ -857,6 +921,8 @@ async function agentTurn(message, shown, shownCls = "user", atts = []) {
   const ub = addMsg(shownCls, esc(shown) + (atts.length ? `<span class="a-att">📎 ${atts.map(a => esc(a.name)).join(", ")}</span>` : ""));
   ub.dataset.msg = message; ub.dataset.shown = shown; ub.dataset.cls = shownCls; ub.dataset.att = JSON.stringify(atts);
   const box = addMsg("assistant", "");
+  agent.chat ||= globalThis.crypto?.randomUUID?.() || "chat-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+  saveAgent();
   let seg = null, segText = "", reply = "";
   const busy = document.createElement("div"); busy.className = "a-busy"; box.append(busy);
   const stick = () => { th.scrollTop = th.scrollHeight; };
@@ -864,6 +930,7 @@ async function agentTurn(message, shown, shownCls = "user", atts = []) {
   try {
     const body = { chat: agent.chat, message, attachments: atts.map(a => a.id), ...(f && f.kind === "neuron" ? { layer: f.layer, n: f.n } : {}) };
     const r = await fetch("/api/agent/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctl.signal });
+    if (!r.ok) { const e = await r.json(); throw new Error(e.error || `ChatGPT request failed (${r.status})`); }
     const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
     for (;;) {
       const { value, done } = await rd.read(); if (done) break;
@@ -872,19 +939,19 @@ async function agentTurn(message, shown, shownCls = "user", atts = []) {
       while ((i = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1); if (!line) continue;
         const e = JSON.parse(line);
-        if (e.t === "chat") agent.chat = e.chat;
+        if (e.t === "chat") { agent.chat = e.chat; scheduleSaveAgent(); }
         else if (e.t === "text") {
           if (!seg) { seg = document.createElement("div"); seg.className = "a-md"; box.insertBefore(seg, busy); segText = ""; }
-          segText += e.text; reply += e.text; seg.innerHTML = md(segText);
+          segText += e.text; reply += e.text; seg.innerHTML = md(segText); scheduleSaveAgent();
         } else if (e.t === "tool") {
           // expandable: the call's arguments, then its (truncated) output once it arrives
           seg = null;
           const d = document.createElement("details"); d.className = "a-tool"; if (e.id) d.dataset.id = e.id;
           d.innerHTML = `<summary>${esc(toolLabel(e.name, e.input || {}))}</summary><pre class="a-io"><b>${esc(e.name)}</b> ${esc(JSON.stringify(e.input || {}, null, 1))}</pre><pre class="a-io out">running…</pre>`;
-          box.insertBefore(d, busy);
+          box.insertBefore(d, busy); scheduleSaveAgent();
         } else if (e.t === "tool_result") {
           const d = [...box.querySelectorAll("details.a-tool")].find(x => x.dataset.id === e.id);
-          if (d) { const o = d.querySelector(".out"); o.textContent = prettyOut(e.output); o.classList.toggle("err", e.error); }
+          if (d) { const o = d.querySelector(".out"); o.textContent = prettyOut(e.output); o.classList.toggle("err", e.error); scheduleSaveAgent(); }
         } else if (e.t === "ui") agentUi(e);
         else if (e.t === "error") { const d = document.createElement("div"); d.className = "a-err"; d.textContent = e.error; box.insertBefore(d, busy); }
         stick();
@@ -896,8 +963,11 @@ async function agentTurn(message, shown, shownCls = "user", atts = []) {
   } finally {
     busy.remove();
     if (agent.ctl === ctl) {
-      agent.ctl = null; setSendMode(false); addTurnControls(); markFresh("claude");
-      if (!ctl.signal.aborted && agent.queue.length) flushQueue();
+      agent.ctl = null; setSendMode(false); addTurnControls(); markFresh("chatgpt");
+      if (agent.queue.length && (!ctl.signal.aborted || agent.flushAfterStop)) {
+        agent.flushAfterStop = false;
+        flushQueue();
+      }
     }
     saveAgent();
   }
@@ -923,35 +993,47 @@ function sendChat() {
   return true;
 }
 
-// ---- stop / queue / interrupt: while Claude works, the send button stops it and new messages queue behind it ----
+// ---- stop / queue / interrupt: while ChatGPT works, the send button stops it and new messages queue behind it ----
 agent.queue = [];
 function setSendMode(busy) {
   const b = $("#a-send"); b.disabled = false; b.classList.toggle("stop", busy);
   b.textContent = busy ? "■" : "↑"; b.title = busy ? "stop" : "send"; b.setAttribute("aria-label", busy ? "stop" : "send");
 }
 function stopAgent() { if (agent.ctl) agent.ctl.abort(); }
+function stopAndFlushQueue() {
+  if (!agent.queue.length) return;
+  if (agent.ctl) { agent.flushAfterStop = true; stopAgent(); }
+  else flushQueue();
+}
 function queueMessage(msg, atts) {
   const q = { msg, atts }; agent.queue.push(q);
-  const d = addMsg("user queued", esc(msg) + (atts.length ? `<span class="a-att">📎 ${atts.map(a => esc(a.name)).join(", ")}</span>` : "")
-    + `<div class="a-qctl"><span>queued</span><button data-q="now">send now</button><button data-q="drop">×</button></div>`);
-  q.el = d;
+  renderQueuedMessage(q);
+  saveAgent();
+}
+function renderQueuedMessage(q) {
+  const content = esc(q.msg) + (q.atts.length ? `<span class="a-att">📎 ${q.atts.map(a => esc(a.name)).join(", ")}</span>` : "")
+    + `<div class="a-qctl"><span>queued</span><button data-q="now">send now</button><button data-q="drop">×</button></div>`;
+  q.el = addMsg("user queued", content);
 }
 function flushQueue() {
   const q = agent.queue.splice(0); if (!q.length) return;
+  agent.flushAfterStop = false;
   for (const x of q) x.el?.remove();
+  saveAgent();
   const msg = q.map(x => x.msg).join("\n\n"), atts = q.flatMap(x => x.atts);
   agentTurn(msg, msg, "user", atts);
 }
 $("#a-thread").addEventListener("click", e => {
   const b = e.target.closest(".a-qctl button"); if (!b) return;
   const el = b.closest(".a-msg"), i = agent.queue.findIndex(x => x.el === el);
-  if (b.dataset.q === "drop") { if (i >= 0) agent.queue.splice(i, 1); el.remove(); return; }
-  stopAgent(); setTimeout(flushQueue, 50);  // interrupt: stop the reply, then send what's queued now
+  if (b.dataset.q === "drop") { if (i >= 0) agent.queue.splice(i, 1); el.remove(); saveAgent(); return; }
+  stopAndFlushQueue();
 });
 
 // ---- attachments: picked, dropped or pasted files upload right away and go with the next message ----
 agent.pending = [];
 function renderPending() {
+  saveAgent();
   $("#a-files").innerHTML = agent.pending.map((a, i) => `<span class="a-file${a.id ? "" : " up"}">${esc(a.name)}<button data-i="${i}" aria-label="remove">×</button></span>`).join("");
 }
 $("#a-files").addEventListener("click", e => { const b = e.target.closest("button"); if (b) { agent.pending.splice(+b.dataset.i, 1); renderPending(); } });
@@ -974,10 +1056,10 @@ agentEl.addEventListener("dragleave", e => { if (!agentEl.contains(e.relatedTarg
 agentEl.addEventListener("drop", e => { if (!e.dataTransfer?.files?.length) return; e.preventDefault(); agentEl.classList.remove("drop"); attachFiles([...e.dataTransfer.files]); });
 $("#a-input").addEventListener("paste", e => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); attachFiles(fs); } });
 
-// ---- edit / reroll the latest turn: cut the claude session back to before it, then resend or hand it back ----
+// ---- edit or reroll the latest turn in app-local conversation history ----
 function clearTurnControls() { document.querySelectorAll("#a-thread .a-ctl").forEach(x => x.remove()); }
 function lastTurn() {
-  const users = [...document.querySelectorAll("#a-thread .a-msg.user")], u = users[users.length - 1];
+  const users = [...document.querySelectorAll("#a-thread .a-msg.user:not(.queued)")], u = users[users.length - 1];
   if (!u) return null;
   const after = []; for (let x = u.nextElementSibling; x; x = x.nextElementSibling) after.push(x);
   return { u, after };
@@ -995,7 +1077,18 @@ async function rewindLast(act) {
   if (agent.ctl) agent.ctl.abort();
   const u = t.u, msg = u.dataset.msg ?? u.childNodes[0]?.textContent ?? "", shown = u.dataset.shown ?? msg;
   const cls = u.dataset.cls || "user", atts = JSON.parse(u.dataset.att || "[]");
-  if (agent.chat) { try { await api("/api/agent/rewind", { chat: agent.chat, text: msg }); } catch {} }
+  if (agent.chat) {
+    try {
+      const result = await api("/api/agent/rewind", { chat: agent.chat, text: msg });
+      if (!result.cut) throw new Error("This turn was not found in the saved ChatGPT history.");
+    } catch (err) {
+      const error = document.createElement("div"); error.className = "a-err";
+      error.textContent = `Could not edit this turn: ${String(err.message || err)}. The conversation is unchanged.`;
+      (t.after.find(x => x.classList.contains("assistant")) || u).append(error);
+      saveAgent();
+      return;
+    }
+  }
   for (const x of [u, ...t.after]) x.remove();
   if (!$("#a-thread").children.length) $("#a-thread").innerHTML = EMPTY;
   if (act === "reroll") agentTurn(msg, shown, cls, atts);
@@ -1003,16 +1096,18 @@ async function rewindLast(act) {
 }
 $("#a-thread").addEventListener("click", e => { const b = e.target.closest(".a-ctl button"); if (b) rewindLast(b.dataset.act); });
 function growInput() { const t = $("#a-input"); t.style.height = "auto"; t.style.height = `${Math.min(200, t.scrollHeight)}px`; }
-$("#a-input").addEventListener("input", growInput);
-// Enter sends; while Claude works it interrupts and sends now (steer); Cmd/Ctrl+Enter queues behind the reply instead
+$("#a-input").addEventListener("input", () => { growInput(); scheduleSaveAgent(); });
+// Enter sends; while ChatGPT works it interrupts and sends now (steer); Cmd/Ctrl+Enter queues behind the reply instead
 $("#a-input").addEventListener("keydown", e => {
   if (e.key !== "Enter" || e.shiftKey) return;
   e.preventDefault();
-  if (agent.ctl && !(e.metaKey || e.ctrlKey)) { if (sendChat()) { stopAgent(); setTimeout(flushQueue, 50); } }
+  if (agent.ctl && !(e.metaKey || e.ctrlKey)) { if (sendChat()) stopAndFlushQueue(); }
   else sendChat();
 });
-// the button sends, or stops while Claude works (Enter still sends, which queues while it works)
+// the button sends, or stops while ChatGPT works (Enter still sends, which queues while it works)
 $("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.ctl) stopAgent(); else sendChat(); });
 $("#a-new").onclick = () => { resetAgent(); clearAgentMarks(); };
 loadAgent(); renderAgentActions();
+renderList();
 syncEdge(); updateInsets();
+addEventListener("pagehide", saveAgent);

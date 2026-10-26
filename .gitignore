@@ -21,3 +21,9 @@ explorer/*.local.md
 
 # per-machine pod settings
 sweep/pod_template.json
+
+# Model-specific derived artifacts and local research output
+explorer/cache/*/
+research_outputs/
+.pytest_cache/
+.ruff_cache/

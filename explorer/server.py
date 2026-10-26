@@ -9,34 +9,59 @@ import json
 import os
 import sys
 import threading
+from contextlib import asynccontextmanager
+from math import ceil, sqrt
+from pathlib import Path
 
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoConfig
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rank import compute_units  # noqa: E402
-from runtime import NO_MODEL, Runtime  # noqa: E402
+DEFAULT_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
+os.environ.setdefault("EXPLORER_MODEL", DEFAULT_MODEL)
+from model_adapter import (
+    DEFAULT_REVISION,
+    model_cache_namespace,
+    resolve_model_revision,
+)
 
-RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
-NAMES = os.path.join(ROOT, "explorer", "names.json")
-PORT = int(os.environ.get("PORT", 8791))
-_cfg = AutoConfig.from_pretrained("Qwen/Qwen3.5-4B").get_text_config()
-ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
-        "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
-        "kv_heads": _cfg.num_key_value_heads, "linear_k_heads": _cfg.linear_num_key_heads,
-        "linear_v_heads": _cfg.linear_num_value_heads}
+if os.environ.get("EXPLORER_MODEL") == DEFAULT_MODEL:
+    os.environ.setdefault("EXPLORER_REVISION", DEFAULT_REVISION)
+from chatgpt_backend import ChatGPTBackend, ChatHistoryError
+from rank import compute_units
+from runtime import NO_MODEL, Runtime
 
-app = FastAPI()
+PORT = int(os.environ.get("PORT", "8791"))
+RUNS_ROOT, STATS_ROOT = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
+
+@asynccontextmanager
+async def lifespan(_app):
+    def preload_model():
+        if NO_MODEL:
+            rt.status = "no model"
+            return
+        rt.ensure_loaded()
+
+    threading.Thread(target=preload_model, daemon=True).start()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 # only this machine's own pages and tools: a page on another site (or a DNS name rebound to 127.0.0.1) can't reach
-# the API, which runs the model and a Claude agent with a shell
+# the API, which runs the local model and ChatGPT's cloud-backed chat
 LOCAL_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}", f"[::1]:{PORT}"}
 
 
@@ -58,24 +83,109 @@ async def no_store(request, call_next):
         resp.headers["Cache-Control"] = "no-store"
     return resp
 
-rt = Runtime(STATS)
+rt = Runtime(STATS_ROOT)
+
+
+def current_model_info():
+    """JSON-safe model identity/config supplied by Runtime without network access."""
+    getter = getattr(rt, "get_model_info", None)
+    if callable(getter):
+        return getter()
+    info = getattr(rt, "model_info", {})
+    return dict(info) if isinstance(info, dict) else {}
+
+
+def architecture_from_config(config):
+    """Extract geometry from the model's saved config; never substitute guessed dimensions."""
+    if not config:
+        return None
+    cfg = config
+    if hasattr(cfg, "get_text_config"):
+        cfg = cfg.get_text_config()
+    if not isinstance(cfg, dict):
+        cfg = getattr(cfg, "to_dict", dict)()
+    if not isinstance(cfg, dict):
+        return None
+    cfg = cfg.get("text_config", cfg)
+    required = ("num_hidden_layers", "hidden_size", "intermediate_size")
+    if any(cfg.get(k) is None for k in required):
+        return None
+    layers = int(cfg["num_hidden_layers"])
+    types = cfg.get("layer_types")
+    if types is None:
+        # Llama's saved config describes ordinary self-attention but omits a repeated type list.
+        if cfg.get("model_type") == "llama" and cfg.get("num_attention_heads") is not None:
+            types = ["full_attention"] * layers
+        else:
+            types = []
+    if len(types) != layers:
+        return None
+    return {
+        "n_layers": layers,
+        "hidden": int(cfg["hidden_size"]),
+        "inter": int(cfg["intermediate_size"]),
+        "grid_side": ceil(sqrt(int(cfg["intermediate_size"]))),
+        "layer_types": list(types),
+        "attn_heads": cfg.get("num_attention_heads"),
+        "kv_heads": cfg.get("num_key_value_heads"),
+        "linear_k_heads": cfg.get("linear_num_key_heads"),
+        "linear_v_heads": cfg.get("linear_num_value_heads"),
+    }
+
+
+_initial_info = current_model_info()
+MODEL_ID = _initial_info.get("model_id") or os.environ.get("EXPLORER_MODEL", DEFAULT_MODEL)
+MODEL_REVISION = _initial_info.get("revision") or resolve_model_revision(
+    MODEL_ID, os.environ.get("EXPLORER_REVISION"))
+CACHE_NAMESPACE = _initial_info.get("cache_namespace") or model_cache_namespace(MODEL_ID, MODEL_REVISION)
+CACHE_DIR = _initial_info.get("cache_dir") or os.path.join(ROOT, "explorer", "cache", CACHE_NAMESPACE)
+RUNS = os.path.join(RUNS_ROOT, CACHE_NAMESPACE)
+ARCH = architecture_from_config(_initial_info.get("config_metadata") or _initial_info.get("config"))
+NAMES = os.path.join(CACHE_DIR, "names.json")
+LENS_INDEX = os.path.join(CACHE_DIR, "lens_index.npz")
+ACT_SCALE = os.path.join(CACHE_DIR, "act_scale.npz")
 _cache = {}
 
 
 def layer_runs():
-    """layer -> path of its sweep run: main_rel preferred, then the largest (calibration runs excluded)."""
+    """Layer -> matching model/revision run. Unscoped legacy runs are never adopted."""
     best = {}
     for meta_path in glob.glob(os.path.join(RUNS, "*.meta.json")):
-        meta = json.load(open(meta_path))
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not run_matches_model(meta):
+            continue
         if meta.get("design_name", "main") == "calib":
             continue
         jsonl = meta_path.replace(".meta.json", ".jsonl")
         if not os.path.exists(jsonl):
             continue
-        key = (meta.get("design_name") == "main_rel", os.path.getsize(jsonl))
-        if key > best.get(meta["layer"], ("", (False, 0)))[1]:
-            best[meta["layer"]] = (jsonl, key)
+        try:
+            layer = int(meta["layer"])
+            key = (meta.get("design_name") == "main_rel", os.path.getsize(jsonl))
+        except (KeyError, TypeError, ValueError, OSError):
+            continue
+        if key > best.get(layer, ("", (False, 0)))[1]:
+            best[layer] = (jsonl, key)
     return {layer: path for layer, (path, _) in best.items()}
+
+
+def run_matches_model(meta):
+    """Require model identity and reject an explicitly different revision.
+
+    The revision-specific run directory supplies revision identity for older run metadata that records only its model.
+    Flat legacy runs outside that directory are intentionally not searched.
+    """
+    if not isinstance(meta, dict):
+        return False
+    model = meta.get("model_id") or meta.get("model")
+    if not isinstance(model, str) or model.strip().casefold() != MODEL_ID.strip().casefold():
+        return False
+    recorded_revision = meta.get("model_revision") or meta.get("revision") or meta.get("commit_hash")
+    return not (recorded_revision and MODEL_REVISION and str(recorded_revision) != str(MODEL_REVISION))
 
 
 _load_lock = threading.Lock()
@@ -93,24 +203,29 @@ def load_layer(layer):
         if _cache.get(layer, {}).get("key") == key:
             return _cache[layer]
         if not (os.path.exists(units_path) and os.path.getmtime(units_path) >= os.path.getmtime(path)):
-            full = [json.loads(l) for l in open(path)]  # ranking needs token ids; done once, then dropped
+            with open(path) as source:
+                full = [json.loads(line) for line in source]  # ranking needs token ids; then dropped
             with open(units_path + ".tmp", "w") as f:
                 f.writelines(json.dumps(u) + "\n" for u in compute_units(full))
             del full
             os.replace(units_path + ".tmp", units_path)
             key = (path, os.path.getmtime(path), os.path.getmtime(units_path))
-        units = [json.loads(l) for l in open(units_path)]
+        with open(units_path) as source:
+            units = [json.loads(line) for line in source]
         # keep only what the explorer shows; token ids, logprobs and alternatives stay on disk
         slim = ("kind", "neuron", "prompt", "dose", "rel_push", "text", "finish", "n_gen")
         rows = []
-        for l in open(path):
-            r = json.loads(l)
-            rows.append({k: r[k] for k in slim})
+        with open(path) as source:
+            for line in source:
+                r = json.loads(line)
+                rows.append({k: r[k] for k in slim})
         by_unit = {}
         for i, r in enumerate(rows):
             by_unit.setdefault((r["kind"], r["neuron"]), []).append(i)
+        with open(path.replace(".jsonl", ".meta.json")) as source:
+            meta = json.load(source)
         _cache[layer] = {"key": key, "path": path, "rows": rows, "units": units, "by_unit": by_unit,
-                         "meta": json.load(open(path.replace(".jsonl", ".meta.json")))}
+                         "meta": meta}
         return _cache[layer]
 
 
@@ -126,10 +241,11 @@ def ranked_words(layer):
     key = (units_path, os.path.getmtime(units_path))
     if _ranked.get(layer, (None,))[0] != key:
         words = {}
-        for line in open(units_path):
-            u = json.loads(line)
-            if u["kind"] == "neuron":
-                words[u["neuron"]] = [w for w, _, _ in u["words"][:4]]
+        with open(units_path) as source:
+            for line in source:
+                u = json.loads(line)
+                if u["kind"] == "neuron":
+                    words[u["neuron"]] = [w for w, _, _ in u["words"][:4]]
         _ranked[layer] = (key, words)
     return _ranked[layer][1]
 
@@ -139,14 +255,47 @@ def swept(layer):
 
 
 def names():
-    return json.load(open(NAMES)) if os.path.exists(NAMES) else {}
+    if not os.path.exists(NAMES):
+        return {}
+    try:
+        with open(NAMES) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def cache_inventory():
+    return {
+        "layout_writes": os.path.exists(os.path.join(CACHE_DIR, "layout_writes.npz")),
+        "layout_reads": os.path.exists(os.path.join(CACHE_DIR, "layout_reads.npz")),
+        "connections": os.path.exists(os.path.join(CACHE_DIR, "connections.npz")),
+        "logit_lens": os.path.exists(LENS_INDEX),
+        "activation_scale": os.path.exists(ACT_SCALE),
+        "steer_lens": os.path.exists(os.path.join(CACHE_DIR, "steer_index.npz")),
+    }
+
+
+def model_payload():
+    info = current_model_info()
+    cfg = info.get("config_metadata") or info.get("config")
+    arch = architecture_from_config(cfg) or ARCH
+    return {
+        "id": info.get("model_id", MODEL_ID),
+        "revision": info.get("revision", MODEL_REVISION),
+        "cache_namespace": info.get("cache_namespace", CACHE_NAMESPACE),
+        "device": info.get("device") or getattr(rt, "dev", None) or "not loaded",
+        "status": getattr(rt, "status", "unknown"),
+        "config_available": arch is not None,
+    }, arch
 
 
 @app.get("/api/index")
 def index():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH,
-            "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
+    info, arch = model_payload()
+    return {"model": info["id"], "model_info": info, "arch": arch,
+            "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())},
+            "has_runs": bool(runs), "cache": cache_inventory(), "status": rt.status}
 
 
 @app.get("/api/units")
@@ -190,9 +339,14 @@ async def set_name(req: Request):
         nm[key] = body["name"].strip()
     else:
         nm.pop(key, None)
-    with open(NAMES, "w") as f:
-        json.dump(nm, f, indent=1, sort_keys=True)
+    await asyncio.to_thread(_write_json, NAMES, nm)
     return {"ok": True}
+
+
+def _write_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(value, f, indent=1, sort_keys=True)
 
 
 @app.get("/api/embeddings")
@@ -212,6 +366,8 @@ def rollout(layer: int, i: int):
 
 @app.get("/api/connections")
 async def connections(layer: int, n: int, k: int = 24, lens: int = 5):
+    if rt.con_index() is None and rt.tok is None and (off := _live_off()):
+        return {"ready": False, "reason": off["error"], "down": [], "up": []}
     out = await asyncio.to_thread(rt.connections, layer, n, k, lens)
     words = await asyncio.to_thread(lambda: {l: ranked_words(l) for l in {c["layer"] for c in out["down"] + out["up"]}})
     nm = names()
@@ -224,6 +380,9 @@ async def connections(layer: int, n: int, k: int = 24, lens: int = 5):
 
 @app.get("/api/hover")
 async def hover(layer: int, n: int):
+    if rt.con_index() is None and rt.lens_index() is None and rt.tok is None and (off := _live_off()):
+        return {"ready": False, "reason": off["error"], "lens": [], "lens_neg": [],
+                "steer": None, "steer_neg": None, "con": {"down": [], "up": []}}
     con = await asyncio.to_thread(rt.connections, layer, n, 16, 0)
     lens = await asyncio.to_thread(rt.lens, layer, n, 8)
     return {"lens": lens["up"], "lens_neg": lens["down"], "steer": lens.get("steer_up"), "steer_neg": lens.get("steer_down"),
@@ -232,17 +391,23 @@ async def hover(layer: int, n: int):
 
 @app.get("/api/lens")
 async def lens(layer: int, n: int):
+    if rt.lens_index() is None and rt.tok is None and (off := _live_off()):
+        return {"ready": False, "reason": off["error"], "up": [], "down": []}
     return await asyncio.to_thread(rt.lens, layer, n, 12)
 
 
 @app.post("/api/reads")
 async def reads(req: Request):
+    if off := _live_off():
+        return JSONResponse(off, status_code=503)
     b = await req.json()
     return await asyncio.to_thread(rt.read, int(b["layer"]), int(b["n"]), b["text"], b.get("chat", True))
 
 
 @app.post("/api/steer")
 async def steer(req: Request):
+    if off := _live_off():
+        return JSONResponse(off, status_code=503)
     b = await req.json()
     loop, q, cancel = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
 
@@ -258,7 +423,7 @@ async def steer(req: Request):
             for row, delta in rt.steer_stream(int(b["layer"]), int(b["n"]), rows, float(b["dose"]),
                                               b.get("mode", "add"), int(b.get("max_new", 300)), cancel):
                 loop.call_soon_threadsafe(q.put_nowait, {"row": row, "t": delta})
-        except Exception as e:  # surfaced in the UI next to the chat
+        except Exception as e:  # noqa: BLE001 - forward unexpected model errors to the streaming client
             loop.call_soon_threadsafe(q.put_nowait, {"row": None, "error": repr(e)})
 
     threading.Thread(target=work, daemon=True).start()
@@ -279,7 +444,6 @@ async def steer(req: Request):
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-LENS_INDEX = os.path.join(ROOT, "explorer", "cache", "lens_index.npz")
 _lens = {}
 
 
@@ -324,11 +488,10 @@ async def search(q: str, limit: int = 300):
         arr = (idx if src == "lens" else st)["up" if sign == "+" else "down"]
         res.append({"layer": l, "n": n, "sign": sign, "rank": rank, "src": src, "name": nm.get(f"L{l}/N{n}", ""),
                     "swept": n in sw[l], "lens": [vocab[t] for t in arr[l, n, :6]]})
-    return {"ready": True, "results": res, "tokens": int(len(match)), "total": len(out)}
+    return {"ready": True, "results": res, "tokens": len(match), "total": len(out)}
 
 
-ACT_SCALE = os.path.join(ROOT, "explorer", "cache", "act_scale.npz")
-MAX_INFER_TOKENS = 1024  # [32, T, 9216] float32 activations plus scores: about 2.4 GB at this length
+MAX_INFER_TOKENS = 1024  # bounded [layers, tokens, intermediate width] activation tensor
 
 
 @app.get("/api/fires")
@@ -452,6 +615,9 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
     N = S.shape[1]
     active = {(int(i // N), int(i % N)) for i in cand}
     ci = rt.con_index()
+    if ci is None:
+        return Response(b"", media_type="application/octet-stream",
+                        headers={"X-Web-Total": "0", "X-Active": str(len(active))})
     rows = []
     for l, n in active:
         for i in range(ci["k"]):
@@ -471,7 +637,9 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
 def layout(kind: str = "writes"):
     """Seriated grid layout: cell index (row * side + col) for every neuron, base64 int16, layer-major."""
     import base64
-    path = os.path.join(ROOT, "explorer", "cache", f"layout_{kind}.npz")
+    if kind not in ("writes", "reads"):
+        return {"available": False, "reason": "unknown layout"}
+    path = os.path.join(CACHE_DIR, f"layout_{kind}.npz")
     if not os.path.exists(path):
         return {"available": False}
     cell = np.load(path)["cell"].astype(np.int16)
@@ -484,6 +652,8 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
     neuron's top `first` links (all when None), later hops each node's top k with z >= zmin, up to `hops` hops; each side keeps at most cap / 2 links.
     Rows: src layer, src neuron, dst layer, dst neuron, z * sign, hop (positive downstream, negative upstream)."""
     ci = rt.con_index()
+    if ci is None:
+        return []
     out = []
     for side, step in (("down", 1), ("up", -1)):
         zs, ls, ns, sg = ci[f"{side}_z"], ci[f"{side}_layer"], ci[f"{side}_n"], ci[f"{side}_sign"]
@@ -529,6 +699,11 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
     `held_by` (the pole that inhibits it)."""
     st = rt.steer_index() if src == "steer" else None
     lens = st if st is not None else rt.lens_index()
+    if lens is None:
+        return {"ready": False, "links": 0,
+                "interpretation": "weight-only candidate links; not causal evidence",
+                "down": {"neurons": 0, "toward": [], "away": []},
+                "up": {"neurons": 0, "fed_by": [], "held_by": []}}
     v = rt.vocab_strings()
     key_src = "steer" if st is not None else "logit"
     if _idf.get("src") != key_src:
@@ -573,15 +748,16 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
     down = [(key, val) for key, val in reach.items() if val[0] > 0]
     up = [(key, val) for key, val in reach.items() if val[0] < 0]
     return {"src": "steer" if st is not None else "logit", "links": len(links),
+            "ready": True, "interpretation": "weight-only candidate links; not causal evidence",
             "down": {"neurons": len(down), "toward": pool(down, 1), "away": pool(down, -1)},
             "up": {"neurons": len(up), "fed_by": pool(up, 1), "held_by": pool(up, -1)}}
 
 
-# ---------- Claude: autointerp and chat ----------
-# Each chat is a `claude -p` session resumed turn by turn. Its tools come from agent_mcp.py, which reads through the
-# endpoints below and sends map actions back through /api/agent/ui into the chat's event stream.
+# ---------- ChatGPT: autointerpretation and chat ----------
+# Each conversation is stored in the model-scoped explorer cache. The MCP server reads through the endpoints below and
+# sends map actions back through /api/agent/ui into the active browser stream.
 AGENT_PROMPT = os.path.join(ROOT, "explorer", "agent_prompt.md")
-AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # claude's cwd, so no project settings or CLAUDE.md apply
+AGENT_DIR = os.path.join(CACHE_DIR, "agent")
 _chats = {}
 _act = {}
 
@@ -599,8 +775,11 @@ def act_range(layer, n):
 @app.get("/api/agent/overview")
 def agent_overview():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH, "layers_with_sweeps": sorted(runs),
-            "named_neurons": len(names()), "live_model": not NO_MODEL}
+    model, arch = model_payload()
+    return {"model": model["id"], "model_info": model, "arch": arch,
+            "layers_with_sweeps": sorted(runs), "named_neurons": len(names()),
+            "live_model": not NO_MODEL and rt.tok is not None,
+            "connection_interpretation": "weight-only candidate links; not causal evidence"}
 
 
 @app.get("/api/agent/names")
@@ -640,7 +819,7 @@ def agent_cone(layer: int, n: int, k: int = 2, limit: int = 120):
     nm = names()
     nodes = sorted(best.items(), key=lambda kv: (abs(kv[1][1]), -abs(kv[1][0])))[:limit]
     per_hop = {}
-    for _, (_, hop) in best.items():
+    for _, hop in best.values():
         per_hop[hop] = per_hop.get(hop, 0) + 1
     return {"links": len(links), "neurons": len(best), "per_hop": dict(sorted(per_hop.items())),
             "note": "weight-only direct-path links chained; paths past hop 1 are leads, not circuits",
@@ -651,13 +830,15 @@ def agent_cone(layer: int, n: int, k: int = 2, limit: int = 120):
 
 def _live_off():
     if NO_MODEL:
-        return {"error": "the live model is off (server started with EXPLORER_NO_MODEL=1); suggest the test instead"}
+        return {"error": "Live inference is disabled; model-specific cached data remains available."}
+    if rt.tok is None:
+        return {"error": f"the live model is not ready (status: {rt.status})"}
     return None
 
 
 @app.post("/api/agent/steer")
 async def agent_steer(req: Request):
-    """Steered rollouts for Claude: one prompt, greedy, pushed up / unsteered / pushed down; whole texts at once."""
+    """Steered rollouts for ChatGPT: one prompt, greedy, pushed up / unsteered / pushed down; whole texts at once."""
     b = await req.json()
     if off := _live_off():
         return off
@@ -678,7 +859,7 @@ async def agent_steer(req: Request):
 
 @app.post("/api/agent/activations")
 async def agent_activations(req: Request):
-    """The neuron's activation on each token of a text, for Claude; compact [token, activation] pairs. With `neurons`
+    """The neuron's activation on each token of a text, for ChatGPT; compact [token, activation] pairs. With `neurons`
     ([{layer, n, dose?, mode?}]) those are pushed during the same pass (steering units)."""
     b = await req.json()
     if off := _live_off():
@@ -693,7 +874,9 @@ async def agent_activations(req: Request):
     hs = [(int(h["layer"]), None if h["head"] in ("all", None) else int(h["head"]), float(h.get("dose", 0))) for h in heads]
     for l, hd, _ in hs:
         if hd is not None and not 0 <= hd < rt.n_heads(l):
-            return {"error": f"layer {l} has {rt.n_heads(l)} heads ({ARCH['layer_types'][l]})"}
+            arch = model_payload()[1]
+            layer_type = arch["layer_types"][l] if arch and l < len(arch["layer_types"]) else "unknown attention type"
+            return {"error": f"layer {l} has {rt.n_heads(l)} heads ({layer_type})"}
     r = await asyncio.to_thread(rt.read, int(b["layer"]), int(b["n"]), b["text"], b.get("chat", False), pushes, hs)
     units = [[u["text"], round(u["act"], 3)] for u in r["units"]]
     top = sorted(units, key=lambda u: -abs(u[1]))[:10]
@@ -711,13 +894,15 @@ def _interventions(b):
     hs = [(int(h["layer"]), None if h["head"] in ("all", None) else int(h["head"]), float(h.get("dose", 0))) for h in heads]
     for l, hd, _ in hs:
         if hd is not None and not 0 <= hd < rt.n_heads(l):
-            return pushes, hs, f"layer {l} has {rt.n_heads(l)} heads ({ARCH['layer_types'][l]})"
+            arch = model_payload()[1]
+            layer_type = arch["layer_types"][l] if arch and l < len(arch["layer_types"]) else "unknown attention type"
+            return pushes, hs, f"layer {l} has {rt.n_heads(l)} heads ({layer_type})"
     return pushes, hs, None
 
 
 @app.post("/api/agent/logprobs")
 async def agent_logprobs(req: Request):
-    """For Claude: the next token's distribution after a text. Body {text, chat?, prefix?, k?, targets?: [str],
+    """For ChatGPT: the next token's distribution after a text. Body {text, chat?, prefix?, k?, targets?: [str],
     neurons?, heads?} (neurons / heads as in /api/agent/activations). Without an intervention: {top, targets}. With
     one: baseline and intervened {top, targets}, kl (nats, baseline to intervened) and the tokens that gained and lost
     the most probability over the whole vocabulary."""
@@ -756,7 +941,7 @@ async def agent_logprobs(req: Request):
 
 @app.post("/api/agent/compare")
 async def agent_compare(req: Request):
-    """For Claude: many neurons read across several texts, one forward pass per text. Body {neurons: [{layer, n}],
+    """For ChatGPT: many neurons read across several texts, one forward pass per text. Body {neurons: [{layer, n}],
     texts: [text | {label, text}], chat?}. Per neuron and text: the strongest positive and negative activation with
     its token, and the peak score (activation over the neuron's usual extreme; position 0, the sink, left out)."""
     b = await req.json()
@@ -785,7 +970,7 @@ async def agent_compare(req: Request):
 
 @app.post("/api/agent/fires")
 async def agent_fires(req: Request):
-    """For Claude: run text through the model and list the neurons firing hardest at one token (the first whose text
+    """For ChatGPT: run text through the model and list the neurons firing hardest at one token (the first whose text
     contains `token`, else the token where any neuron fires hardest). Leaves the person's paste box alone."""
     b = await req.json()
     if off := _live_off():
@@ -826,47 +1011,55 @@ async def agent_ui(req: Request):
 
 
 UPLOADS = os.path.join(AGENT_DIR, "uploads")
-FILE_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit", "Bash"]
 
 
 @app.post("/api/agent/upload")
 async def agent_upload(req: Request):
-    """A file for the chat, sent as base64 JSON {name, type, data}; kept under explorer/cache/agent/uploads."""
+    """A file for the chat, sent as base64 JSON {name, type, data}; kept under this model's explorer cache."""
     import base64
     import uuid
     b = await req.json()
     raw = base64.b64decode(b["data"])
     if len(raw) > 25 << 20:
         return JSONResponse({"error": "file over 25 MB"}, status_code=413)
-    os.makedirs(UPLOADS, exist_ok=True)
+    if b.get("type") == "application/pdf" or str(b.get("name", "")).lower().endswith(".pdf"):
+        return JSONResponse({"error": "PDF attachments are not supported. Attach extracted text or an image instead."}, status_code=415)
     fid = uuid.uuid4().hex[:12]
     name = os.path.basename(b.get("name") or "file")
-    with open(os.path.join(UPLOADS, f"{fid}-{name}"), "wb") as f:
-        f.write(raw)
-    with open(os.path.join(UPLOADS, f"{fid}.json"), "w") as f:
-        json.dump({"name": name, "type": b.get("type") or "", "size": len(raw)}, f)
+    await asyncio.to_thread(_persist_agent_upload, fid, name, b.get("type") or "", raw)
     return {"id": fid, "name": name, "size": len(raw)}
 
 
-def attachment_block(fid):
-    """An uploaded file as a message content block: images and PDFs as themselves, anything else as text."""
-    import base64
+def _persist_agent_upload(fid, name, content_type, raw):
+    os.makedirs(UPLOADS, exist_ok=True)
+    with open(os.path.join(UPLOADS, f"{fid}-{name}"), "wb") as f:
+        f.write(raw)
+    with open(os.path.join(UPLOADS, f"{fid}.json"), "w") as f:
+        json.dump({"name": name, "type": content_type, "size": len(raw)}, f)
+
+
+def attachment_inputs(fid):
+    """Return text for a document attachment or a local image path for Codex CLI."""
     fid = os.path.basename(str(fid))
     meta_path = os.path.join(UPLOADS, f"{fid}.json")
     if not os.path.exists(meta_path):
-        return None
-    meta = json.load(open(meta_path))
-    raw = open(os.path.join(UPLOADS, f"{fid}-{meta['name']}"), "rb").read()
+        raise ValueError(f"Attachment {fid!r} is missing or has expired. Remove it and attach the file again.")
+    with open(meta_path) as f:
+        meta = json.load(f)
+    path = os.path.join(UPLOADS, f"{fid}-{meta['name']}")
+    if not os.path.isfile(path):
+        raise ValueError(f"Attachment {meta['name']!r} is missing or has expired. Attach it again.")
     kind = meta["type"]
     if kind in ("image/png", "image/jpeg", "image/gif", "image/webp"):
-        return {"type": "image", "source": {"type": "base64", "media_type": kind, "data": base64.b64encode(raw).decode()}}
+        return f"Image attachment: {meta['name']}", path
     if kind == "application/pdf" or meta["name"].lower().endswith(".pdf"):
-        return {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                               "data": base64.b64encode(raw).decode()}, "title": meta["name"]}
+        raise ValueError(f"PDF attachment {meta['name']!r} is not supported. Attach extracted text or an image instead.")
+    with open(path, "rb") as f:
+        raw = f.read()
     text = raw.decode("utf-8", errors="replace")
     cut = 200_000
     more = f"\n[... {len(text) - cut} more characters cut]" if len(text) > cut else ""
-    return {"type": "text", "text": f'<file name="{meta["name"]}">\n{text[:cut]}{more}\n</file>'}
+    return f'<file name="{meta["name"]}">\n{text[:cut]}{more}\n</file>', None
 
 
 AGENT_METHOD = os.path.join(ROOT, "explorer", "agent_methodology.md")
@@ -876,199 +1069,121 @@ AGENT_LOCAL = os.path.join(ROOT, "explorer", "agent_prompt.local.md")  # this ma
 def agent_prompt_file():
     """agent_prompt.md, then agent_methodology.md and agent_prompt.local.md when present, with {ROOT} filled in as
     this checkout's path, written beside the chat's working files."""
-    text = open(AGENT_PROMPT).read()
+    text = Path(AGENT_PROMPT).read_text()
     for extra in (AGENT_METHOD, AGENT_LOCAL):
         if os.path.exists(extra):
-            text = text.rstrip() + "\n\n" + open(extra).read()
+            text = text.rstrip() + "\n\n" + Path(extra).read_text()
     text = text.replace("{ROOT}", ROOT)
     out = os.path.join(AGENT_DIR, "system_prompt.md")
-    if not os.path.exists(out) or open(out).read() != text:
-        with open(out, "w") as f:
-            f.write(text)
+    if not os.path.exists(out) or Path(out).read_text() != text:
+        Path(out).write_text(text)
     return out
 
 
-async def _stop_turn(proc):
-    import signal
-    if proc is None or proc.returncode is not None:
-        return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            return
-        try:
-            await asyncio.wait_for(proc.wait(), 5)
-            return
-        except asyncio.TimeoutError:
-            pass
-
-
-def _session_file(sid):
-    hits = glob.glob(os.path.join(os.path.expanduser("~/.claude/projects"), "*", f"{os.path.basename(sid)}.jsonl"))
-    return hits[0] if hits else None
-
-
-def _user_text(m):
-    """The text of a message the person sent (None for tool results and CLI-injected notes)."""
-    if m.get("type") != "user" or m.get("isMeta"):
-        return None
-    c = (m.get("message") or {}).get("content")
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list) and not any(isinstance(x, dict) and x.get("type") == "tool_result" for x in c):
-        # the first text block is what they typed; attached text files follow as blocks of their own
-        return next((x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text"), "")
-    return None
+chat_backend = ChatGPTBackend(
+    os.path.join(ROOT, "explorer", "cache"),
+    CACHE_NAMESPACE,
+    codex_bin=os.environ.get("EXPLORER_CODEX_BIN", "codex"),
+    model=os.environ.get("EXPLORER_CODEX_MODEL"),
+    cwd=AGENT_DIR,
+    mcp_command=sys.executable,
+    mcp_args=(os.path.join(ROOT, "explorer", "agent_mcp.py"),),
+    mcp_env={"EXPLORER_URL": f"http://127.0.0.1:{PORT}"},
+)
 
 
 @app.post("/api/agent/rewind")
 async def agent_rewind(req: Request):
-    """Cut a chat's claude session back to just before the last message the person sent that ends with `text`
-    (everything after it goes too: the reply, a refusal, CLI notes). The cut session is backed up beside it first.
-    No match (already cut) is not an error."""
-    import shutil
-    import time
+    """Remove the latest user turn and its reply from this app's local conversation history."""
     b = await req.json()
-    sid, text = b["chat"], (b.get("text") or "").strip()
-    path = _session_file(sid)
-    if not path:
-        return {"ok": True, "cut": False}
-    lines = open(path).read().splitlines(True)
-    at = None
-    for i in range(len(lines) - 1, -1, -1):
-        try:
-            t = _user_text(json.loads(lines[i]))
-        except ValueError:
-            continue
-        if t is not None and (not text or t.strip() == text or t.strip().endswith("\n\n" + text) or t.split("\n\n", 1)[-1].strip() == text):
-            at = i
-            break
-    if at is None:
-        return {"ok": True, "cut": False}
-    shutil.copy(path, f"{path}.bak-{int(time.time())}")
-    keep = lines[:at]
-    if not any(_user_text(json.loads(x)) is not None for x in keep if x.strip()):
-        os.remove(path)  # nothing the person said is left: the next turn starts the session afresh
-    else:
-        with open(path, "w") as f:
-            f.writelines(keep)
-    return {"ok": True, "cut": True}
+    return await asyncio.to_thread(chat_backend.rewind_chat, b["chat"], b.get("text", ""))
 
 
 @app.post("/api/agent/chat")
 async def agent_chat(req: Request):
     """One turn. Body: {chat?, message, layer?, n?, attachments?: [upload ids]}. Streams NDJSON events: chat, text,
     tool, tool_result, ui, done, error."""
-    import uuid
     b = await req.json()
-    # the chat id is the claude session id, so a chat the browser kept survives server restarts (it resumes)
-    cid = b.get("chat") or str(uuid.uuid4())
-    c = _chats.setdefault(cid, {"session": cid})
-    c["queue"] = q = asyncio.Queue()
-    msg = b["message"]
+    if not isinstance(b, dict):
+        return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
+    msg = b.get("message")
+    if not isinstance(msg, str) or not msg.strip():
+        return JSONResponse({"error": "Message must be a non-empty string."}, status_code=400)
+    raw_chat_id = b.get("chat")
+    if raw_chat_id is not None and not isinstance(raw_chat_id, str):
+        return JSONResponse({"error": "Chat ID must be a string."}, status_code=400)
+    import uuid
+    cid = raw_chat_id or str(uuid.uuid4())
+    try:
+        await asyncio.to_thread(chat_backend.history.load, cid)
+    except ChatHistoryError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    c = _chats.get(cid)
+    if c and c.get("active"):
+        return JSONResponse({"error": "A turn is already active for this conversation."}, status_code=409)
+    attachment_ids = b.get("attachments") or []
+    if not isinstance(attachment_ids, list) or any(not isinstance(value, str) or not value for value in attachment_ids):
+        return JSONResponse({"error": "Attachments must be a list of upload IDs."}, status_code=400)
     if b.get("layer") is not None:
-        msg = f"[The person has L{int(b['layer'])} N{int(b['n'])} open in the explorer.]\n\n{msg}"
+        try:
+            layer, neuron = int(b["layer"]), int(b["n"])
+        except (KeyError, TypeError, ValueError):
+            return JSONResponse({"error": "Layer and neuron must be integers."}, status_code=400)
+        if not ARCH or not (0 <= layer < ARCH["n_layers"] and 0 <= neuron < ARCH["inter"]):
+            return JSONResponse({"error": "The selected layer or neuron is outside the active model architecture."}, status_code=400)
     os.makedirs(AGENT_DIR, exist_ok=True)
-    mcp = {"mcpServers": {"explorer": {"command": sys.executable, "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")],
-                                       "env": {"EXPLORER_URL": f"http://127.0.0.1:{PORT}", "EXPLORER_CHAT": cid}}}}
-    content = [{"type": "text", "text": msg}] + [blk for a in b.get("attachments") or [] if (blk := attachment_block(a))]
-    cmd = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-           "--system-prompt-file", agent_prompt_file(), "--mcp-config", json.dumps(mcp), "--strict-mcp-config",
-           # file tools and a shell, so it can run scripts against this server (e.g. score a file it shouldn't read)
-           "--tools", *FILE_TOOLS, "--allowedTools", "mcp__explorer", *FILE_TOOLS,
-           "--add-dir", os.path.expanduser("~"), "--setting-sources", "project"]
-    if os.environ.get("EXPLORER_CLAUDE_MODEL"):
-        cmd += ["--model", os.environ["EXPLORER_CLAUDE_MODEL"]]
+    context = ""
+    if b.get("layer") is not None:
+        context = f"The person has L{layer} N{neuron} open in the explorer."
+    try:
+        prepared = await asyncio.to_thread(_prepare_attachments, attachment_ids)
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    attachments = [text for text, _ in prepared if text]
+    image_paths = [path for _, path in prepared if path]
+    prompt_path = await asyncio.to_thread(agent_prompt_file)
+    system_prompt = await asyncio.to_thread(Path(prompt_path).read_text)
+    c = c or {}
+    if c.get("active") or not chat_backend.reserve_chat(cid):
+        return JSONResponse({"error": "A turn is already active for this conversation."}, status_code=409)
+    c["queue"] = q = asyncio.Queue()
+    c["active"] = True
+    _chats[cid] = c
 
     async def events():
-        # a turn that was interrupted may still be exiting; it holds the session until it does
-        await _stop_turn(c.get("proc"))
-        # resume once the session exists on disk (any earlier turn, finished or interrupted, creates it)
-        sess = ["--resume", c["session"]] if _session_file(c["session"]) else ["--session-id", c["session"]]
-        # its own process group, so stopping a turn also stops what it started (MCP server, shell scripts)
-        proc = c["proc"] = await asyncio.create_subprocess_exec(*cmd, *sess, cwd=AGENT_DIR, stdin=asyncio.subprocess.PIPE,
-                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                                                    limit=1 << 24, start_new_session=True)
-        proc.stdin.write((json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n").encode())
-        await proc.stdin.drain()
-        proc.stdin.close()
-
-        async def pump():
-            async for line in proc.stdout:
-                q.put_nowait(("claude", line))
-            q.put_nowait(("end", (await proc.stderr.read()).decode(errors="replace")))
-        task = asyncio.create_task(pump())
-        yield json.dumps({"t": "chat", "chat": cid}) + "\n"
         try:
-            while True:
-                kind, item = await q.get()
-                if kind == "ui":
-                    yield json.dumps({"t": "ui", **item}) + "\n"
-                    continue
-                if kind == "end":
-                    if await proc.wait() != 0:
-                        yield json.dumps({"t": "error", "error": item.strip()[-600:] or f"claude exited {proc.returncode}"}) + "\n"
-                    break
-                try:
-                    m = json.loads(item)
-                except ValueError:
-                    continue
-                if m.get("type") == "stream_event":
-                    e = m["event"]
-                    if e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta":
-                        yield json.dumps({"t": "text", "text": e["delta"]["text"]}) + "\n"
-                elif m.get("type") == "assistant":
-                    for blk in m["message"].get("content", []):
-                        if blk.get("type") == "tool_use":
-                            yield json.dumps({"t": "tool", "id": blk.get("id"), "input": blk.get("input"),
-                                              "name": blk["name"].removeprefix("mcp__explorer__")}) + "\n"
-                elif m.get("type") == "user":
-                    for blk in (m.get("message") or {}).get("content") or []:
-                        if isinstance(blk, dict) and blk.get("type") == "tool_result":
-                            out = blk.get("content")
-                            if isinstance(out, list):
-                                out = "\n".join(x.get("text", "") for x in out if isinstance(x, dict))
-                            out = str(out or "")
-                            yield json.dumps({"t": "tool_result", "id": blk.get("tool_use_id"), "error": bool(blk.get("is_error")),
-                                              "output": out[:1500] + (f" … ({len(out)} chars)" if len(out) > 1500 else "")}) + "\n"
-                elif m.get("type") == "result":
-                    if m.get("is_error"):
-                        yield json.dumps({"t": "error", "error": str(m.get("result"))[:600]}) + "\n"
-                    yield json.dumps({"t": "done", "cost": m.get("total_cost_usd")}) + "\n"
+            async for event in chat_backend.stream_turn(
+                cid,
+                msg,
+                system_prompt=system_prompt,
+                context=context,
+                attachments=attachments,
+                image_paths=image_paths,
+                on_process=lambda proc: c.__setitem__("proc", proc),
+                ui_queue=q,
+                reserved=True,
+            ):
+                yield json.dumps(event, ensure_ascii=False) + "\n"
         finally:
-            task.cancel()
-            import signal
-            try:
-                os.killpg(proc.pid, signal.SIGTERM if proc.returncode is None else signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            c["active"] = False
+            c.pop("queue", None)
+            chat_backend.release_chat(cid)
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
+def _prepare_attachments(attachment_ids):
+    return [attachment_inputs(attachment_id) for attachment_id in attachment_ids]
+
+
 @app.get("/api/status")
 def status():
-    return {"status": rt.status}
+    model, arch = model_payload()
+    return {"status": rt.status, "model": model, "arch": arch, "has_runs": bool(layer_runs()),
+            "cache": cache_inventory()}
 
 
 app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), html=True), name="static")
-
-@app.on_event("startup")
-def preload():
-    def go():
-        if NO_MODEL:
-            rt.status = "no model"
-            rt.vocab_strings()
-            return
-        rt.ensure_loaded()
-        if not os.path.exists(LENS_INDEX):
-            os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
-            rt.build_lens_index(LENS_INDEX)
-        rt.vocab_strings()
-        if not os.path.exists(ACT_SCALE):
-            rt.build_act_scale(ACT_SCALE)
-    threading.Thread(target=go, daemon=True).start()
 
 
 if __name__ == "__main__":

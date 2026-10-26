@@ -29,14 +29,26 @@ Rerunning the same command resumes: rollouts already in the jsonl are skipped.
 """
 import argparse
 import functools
+import hashlib
 import json
 import os
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "explorer"))
+from model_adapter import (
+    DEFAULT_MODEL,
+    infer_model_family,
+    model_cache_namespace,
+    resolve_model_revision,
+)
 
 PROMPTS = {
     "who": "Who are you?",
@@ -86,19 +98,20 @@ def rollout_record(out, job, layer, top_k):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    ap.add_argument("--model", default=os.environ.get("EXPLORER_MODEL", DEFAULT_MODEL))
+    ap.add_argument("--revision", default=os.environ.get("EXPLORER_REVISION"))
     ap.add_argument("--stats", required=True, help="npz from neuron_stats.py for the layer to steer")
     ap.add_argument("--neurons", default="all", help='"all", "random:128", "2742", "0-99", or "1,5,9-12"')
     ap.add_argument("--design", default="main", choices=sorted(DESIGNS))
     ap.add_argument("--dose-unit", default="absmax", choices=["absmax", "rel"], help="absmax: dose x the neuron's "
                     "abs_max; rel: dose x the median residual norm, the same push size for every neuron")
     ap.add_argument("--run", required=True, help="run name: output file and capture tag")
-    ap.add_argument("--out-dir", default="runs")
+    ap.add_argument("--out-dir", help="output directory; defaults to runs/<model-and-revision>")
     ap.add_argument("--max-tokens", type=int, default=256, help="steered rollouts often loop; this bounds them")
     ap.add_argument("--top-k", type=int, default=5, help="alternative tokens kept per generated step")
     ap.add_argument("--capture-layers", default="+0,+1,+4,+8", help="mlp_in layers to capture, relative to the "
                     "steered layer; empty string turns capture off")
-    ap.add_argument("--capture-root", default="captures")
+    ap.add_argument("--capture-root", help="capture directory; defaults to captures/<model-and-revision>")
     ap.add_argument("--capture-layout", default="packed", choices=["packed", "sharded"], help="packed publishes each "
                     "rollout when it finishes; sharded publishes only when a shard seals")
     ap.add_argument("--random-controls", type=int, default=256, help="random-direction controls spread through the run")
@@ -110,35 +123,86 @@ def main():
     ap.add_argument("--gpu-mem", type=float, default=0.85)
     a = ap.parse_args()
 
+    revision = resolve_model_revision(a.model, a.revision)
+    namespace = model_cache_namespace(a.model, revision)
+    out_dir = a.out_dir or str(PROJECT_ROOT / "runs" / namespace)
+    capture_root = a.capture_root or str(PROJECT_ROOT / "captures" / namespace)
+
     st = np.load(a.stats)
+    if os.path.basename(os.path.dirname(os.path.abspath(a.stats))) != namespace:
+        ap.error(f"stats must be stored under stats/{namespace}/ for this model revision")
+    for key in ("model", "model_id"):
+        if key in st and str(np.asarray(st[key]).item()).casefold() != a.model.casefold():
+            ap.error("stats model does not match --model")
+    if "revision" in st and str(np.asarray(st["revision"]).item()) != str(revision or ""):
+        ap.error("stats revision does not match --revision")
     layer, abs_max, w_down = int(st["layer"]), st["abs_max"], st["w_down"]
     neurons = parse_neurons(a.neurons, len(abs_max), a.seed)
     design = DESIGNS[a.design]
     resid_p50 = float(st["resid_norm_q10_50_90"][1])
     down_norm = np.linalg.norm(w_down.astype(np.float32), axis=1)
-    text_cfg = AutoConfig.from_pretrained(a.model).get_text_config()
+    config_kwargs = {"revision": revision} if revision else {}
+    config = AutoConfig.from_pretrained(a.model, **config_kwargs)
+    text_cfg = config.get_text_config()
     assert not getattr(text_cfg, "layer_scale", False), "mlp_out sits after an FFN layer scale on this model, so " \
         "adding W_down[:, n] there is no longer a pure push on neuron n"
     n_layers = text_cfg.num_hidden_layers
     cap_layers = sorted({layer + int(x) for x in a.capture_layers.split(",") if x} & set(range(n_layers)))
 
-    tok = AutoTokenizer.from_pretrained(a.model)
-    prompt_ids = {
-        k: tok.apply_chat_template([{"role": "user", "content": v}], add_generation_prompt=True,
-                                   enable_thinking=False, tokenize=True)
-        for k, v in PROMPTS.items()
-    }
+    tok = AutoTokenizer.from_pretrained(a.model, **config_kwargs)
+    template_kwargs = {"add_generation_prompt": True, "tokenize": True}
+    if infer_model_family(a.model, config) == "qwen3_5":
+        template_kwargs["enable_thinking"] = False
+    prompt_ids = {k: tok.apply_chat_template([{"role": "user", "content": v}], **template_kwargs)
+                  for k, v in PROMPTS.items()}
     prompt_ids = {k: list(v["input_ids"] if hasattr(v, "keys") else v) for k, v in prompt_ids.items()}
 
-    os.makedirs(a.out_dir, exist_ok=True)
-    out_path = os.path.join(a.out_dir, f"{a.run}.jsonl")
-    with open(os.path.join(a.out_dir, f"{a.run}.meta.json"), "w") as f:
-        json.dump({"model": a.model, "layer": layer, "stats": os.path.abspath(a.stats), "prompts": PROMPTS,
-                   "design_name": a.design, "design": design, "resid_norm_p50": resid_p50, "dose_unit": a.dose_unit,
-                   "hook": "mlp_out", "max_tokens": a.max_tokens, "top_k": a.top_k, "capture_layers": cap_layers,
-                   "capture_hook": "mlp_in", "capture_positions": "last_prompt",
-                   "capture_root": os.path.abspath(a.capture_root), "capture_tag": a.run,
-                   "prompt_ids": prompt_ids}, f, indent=1)
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(capture_root, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{a.run}.jsonl")
+    meta_path = os.path.join(out_dir, f"{a.run}.meta.json")
+    digest = hashlib.sha256()
+    with open(a.stats, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    metadata = {
+        "model": a.model,
+        "model_id": a.model,
+        "revision": revision,
+        "model_revision": revision,
+        "model_cache_namespace": namespace,
+        "layer": layer,
+        "stats": os.path.abspath(a.stats),
+        "stats_sha256": digest.hexdigest(),
+        "prompts": PROMPTS,
+        "design_name": a.design,
+        "design": design,
+        "resid_norm_p50": resid_p50,
+        "dose_unit": a.dose_unit,
+        "seed": a.seed,
+        "random_controls": a.random_controls,
+        "hook": "mlp_out",
+        "max_tokens": a.max_tokens,
+        "top_k": a.top_k,
+        "capture_layers": cap_layers,
+        "capture_hook": "mlp_in",
+        "capture_positions": "last_prompt",
+        "capture_root": os.path.abspath(capture_root),
+        "capture_tag": a.run,
+        "prompt_ids": prompt_ids,
+    }
+    if os.path.exists(out_path) or os.path.exists(meta_path):
+        if not os.path.exists(meta_path):
+            ap.error("existing rollout data has no metadata; choose a new --run name")
+        try:
+            with open(meta_path) as f:
+                existing_metadata = json.load(f)
+        except (OSError, ValueError):
+            ap.error("existing run metadata is unreadable; choose a new --run name")
+        if existing_metadata != metadata:
+            ap.error("existing run metadata differs from this invocation; choose a new --run name")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=1)
 
     # Random-direction controls: neuron j's down column rotated to a random direction (same norm, same abs_max).
     # They answer "how often does a theme appear when the steered direction means nothing?"
@@ -167,10 +231,10 @@ def main():
         return
 
     llm = LLM(
-        model=a.model, dtype="bfloat16", enable_steering=True, max_steering_configs=a.max_configs,
+        model=a.model, revision=revision, dtype="bfloat16", enable_steering=True, max_steering_configs=a.max_configs,
         max_num_seqs=a.max_num_seqs, max_model_len=max(map(len, prompt_ids.values())) + a.max_tokens + 16,
         gpu_memory_utilization=a.gpu_mem, limit_mm_per_prompt={"image": 0, "video": 0}, shutdown_timeout=120,
-        capture_consumers=[{"name": "filesystem", "params": {"root": a.capture_root}}] if cap_layers else None,
+        capture_consumers=[{"name": "filesystem", "params": {"root": capture_root}}] if cap_layers else None,
     )
 
     @functools.lru_cache(maxsize=256)

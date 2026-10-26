@@ -1,3 +1,10 @@
+# Historical upstream methodology notes
+
+The following material describes the upstream Qwen exploration. Its neuron IDs, dimensions,
+measurements, and examples are historical observations, not evidence about the current Llama
+checkpoint. Apply experimental principles cautiously and verify all model-specific claims
+through the active explorer. The current agent prompt takes precedence over these notes.
+
 # Interpreting neurons in Qwen3.5-4B: methodology
 
 A working method for explaining a single MLP neuron, built from hands-on investigation in the explorer. It complements the explorer prompt above and uses its vocabulary (poles, steer lens, cone, web summary).

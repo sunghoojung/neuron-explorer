@@ -262,7 +262,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   const dataLayers = new Set();
   let unitsLayer = null;
 
-  // annotations: short HTML labels pinned to neurons, re-projected every frame (Claude points things out with these)
+  // annotations: short HTML labels pinned to neurons, re-projected every frame (ChatGPT points things out with these)
   let notes = [];
   function placeNotes() {
     const w = canvas.clientWidth, h = canvas.clientHeight;
@@ -304,7 +304,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       // distance at which the model's bounding sphere fits the visible gap, then place the camera there once
       const center = home.target, r = Math.max(...bounds.map(b => b.distanceTo(center)));
       const vHalf = THREE.MathUtils.degToRad(camera.fov / 2), hHalf = Math.atan(Math.tan(vHalf) * availW / h);
-      homeDist = r / Math.sin(Math.min(vHalf, hHalf)) * 0.82;
+      homeDist = r / Math.sin(Math.min(vHalf, hHalf)) * (narrow ? 1.04 : 0.82);
       camera.position.copy(home.target).addScaledVector(home.dir, homeDist);
       controls.update();
       fitPerPx = homeDist;

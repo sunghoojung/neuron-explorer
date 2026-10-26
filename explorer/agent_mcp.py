@@ -1,6 +1,6 @@
-"""Stdio MCP server that gives the explorer's Claude chat its tools: read any neuron data through the explorer's HTTP API,
+"""Stdio MCP server that gives the explorer's ChatGPT chat its tools: read any neuron data through the explorer's HTTP API,
 run the live model (steered rollouts, activations) when it is loaded, and drive the map (select, highlight) in the browser that started the chat. Standard library only; started by
-`claude -p --mcp-config ...` from server.py with EXPLORER_URL and EXPLORER_CHAT set.
+the Codex CLI MCP integration from server.py with EXPLORER_URL and EXPLORER_CHAT set.
 """
 import json
 import os
@@ -11,7 +11,7 @@ import urllib.request
 URL = os.environ.get("EXPLORER_URL", "http://127.0.0.1:8791")
 CHAT = os.environ.get("EXPLORER_CHAT", "")
 
-LN = {"layer": {"type": "integer", "description": "layer, 0-31"}, "n": {"type": "integer", "description": "neuron, 0-9215"}}
+LN = {"layer": {"type": "integer", "description": "zero-based layer index; bounds are in overview"}, "n": {"type": "integer", "description": "zero-based MLP neuron index; bounds are in overview"}}
 TOOLS = [
     {"name": "overview", "description": "Model architecture and which layers have sweep runs (rollouts and rankings).",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -70,8 +70,7 @@ TOOLS = [
      "it as a user turn). Compare against act_range from `neuron`. Optional `neurons` [{layer, n, dose?, mode?}] are "
      "pushed during the same pass (steering units), to test causally whether they drive this neuron: compare with the "
      "same call without them. {layer, all: true, dose: 0} zeroes that layer's whole MLP. Optional `heads` [{layer, "
-     "head, dose}] scale attention heads (dose 0 = ablate; head 'all' = every head; full-attention layers have 16 heads, "
-     "linear-attention layers 32 value heads; layer types are in `overview`). Only earlier layers can move it. Needs "
+     "head, dose}] scale attention heads (dose 0 = ablate; head 'all' = every head; head counts and layer types are in `overview`). Only earlier layers can move it. Needs "
      "the live model; errors if it is off.",
      "inputSchema": {"type": "object", "properties": {**LN, "text": {"type": "string"},
                                                        "chat": {"type": "boolean", "default": False},
@@ -244,7 +243,7 @@ for line in sys.stdin:
         try:
             out = call(p["name"], p.get("arguments") or {})
             reply(id_, {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}]})
-        except Exception as e:  # tool errors go back to the model, not the protocol
+        except Exception as e:  # noqa: BLE001 - isolate each MCP tool failure from the protocol loop
             reply(id_, {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True})
     elif method == "ping":
         reply(id_, {})
