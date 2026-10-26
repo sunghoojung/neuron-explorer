@@ -32,6 +32,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
@@ -46,6 +47,7 @@ if os.environ.get("EXPLORER_MODEL") == DEFAULT_MODEL:
     os.environ.setdefault("EXPLORER_REVISION", DEFAULT_REVISION)
 from chatgpt_backend import ChatGPTBackend, ChatHistoryError
 from rank import compute_units
+from residual_api import create_residual_router
 from runtime import NO_MODEL, Runtime
 from som_service import (
     MAX_NATIVE_MAP_PNG_BYTES,
@@ -70,6 +72,7 @@ async def lifespan(_app):
     try:
         yield
     finally:
+        await asyncio.to_thread(residual_service.close)
         await asyncio.to_thread(som_service.close)
 
 
@@ -101,6 +104,8 @@ async def no_store(request, call_next):
 
 rt = Runtime(STATS_ROOT)
 som_service = SOMService(repo_root=ROOT)
+residual_router, residual_service = create_residual_router(rt, ROOT)
+app.include_router(residual_router)
 
 
 def current_model_info():

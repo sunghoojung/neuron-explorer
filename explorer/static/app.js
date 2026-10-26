@@ -158,12 +158,41 @@ document.querySelectorAll("#color-by button").forEach(b => b.onclick = () => {
 
 // ---------- views / layer ----------
 document.querySelectorAll("#views button").forEach(b => b.onclick = () => setView(b.dataset.view));
+let residualWorkspacePromise = null;
 function setView(v) {
   state.view = v;
+  document.body.classList.toggle("residual-open", v === "residuals");
+  if (v === "residuals" && location.hash !== "#residuals") history.replaceState(null, "", `${location.pathname}${location.search}#residuals`);
+  if (v !== "residuals" && location.hash === "#residuals") history.replaceState(null, "", `${location.pathname}${location.search}`);
   document.querySelectorAll("#views button").forEach(x => x.classList.toggle("on", x.dataset.view === v));
   $("#map-view").classList.toggle("on", v === "map");
   $("#embed-view").classList.toggle("on", v === "embed");
+  $("#residuals-view").classList.toggle("on", v === "residuals");
   if (v === "embed") loadEmbeddings();
+  if (v === "residuals") loadResidualWorkspace();
+}
+if (location.hash === "#residuals") setView("residuals");
+function loadResidualWorkspace() {
+  if (residualWorkspacePromise) return residualWorkspacePromise;
+  residualWorkspacePromise = (async () => {
+    const response = await fetch("/residuals.html");
+    if (!response.ok) throw new Error(`Residual workspace could not be loaded (${response.status}).`);
+    const documentSource = new DOMParser().parseFromString(await response.text(), "text/html");
+    const workspace = documentSource.querySelector("main.workspace");
+    const host = $("#residuals-host");
+    if (!workspace || !host) throw new Error("Residual workspace markup is missing.");
+    host.replaceChildren(workspace);
+    const stylesheet = document.createElement("link");
+    stylesheet.rel = "stylesheet";
+    stylesheet.href = "/residuals.css?v=2";
+    document.head.append(stylesheet);
+    await import("./residuals.js?native=1");
+  })().catch(error => {
+    residualWorkspacePromise = null;
+    const host = $("#residuals-host");
+    if (host) host.textContent = `Residual workspace unavailable: ${error.message}`;
+  });
+  return residualWorkspacePromise;
 }
 const layerSel = $("#layer");
 for (let l = 0; arch && l < arch.n_layers; l++) {
@@ -199,7 +228,7 @@ async function loadEmbeddings() {
   $("#embed-empty").textContent = "…";
   const d = index.layers[l] ? await api(`/api/embeddings?layer=${l}`) : {};
   if (state.layer !== l) return;
-  $("#embed-empty").textContent = d.x ? "" : "—";
+  $("#embed-empty").textContent = d.x ? "" : "-";
   scatter.setData(d.x ? { ...d, layer: l } : null);
   scatter.select(state.layer, state.focus?.layer === state.layer ? state.focus.n : null);
 }
@@ -510,7 +539,7 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   const u = await api(`/api/unit?layer=${layer}&n=${n}&kind=${kind}`);
   if (!isFocus(layer, n, kind)) return;
   setNameField(u.name || "");
-  if (u.stats) $("#f-rank").textContent = `#${u.rank ?? "—"}/${u.n_ranked}  mass ${(u.stats.mass ?? u.stats.z).toFixed(1)}  null ${(u.stats.null_pct * 100).toFixed(0)}%`;
+  if (u.stats) $("#f-rank").textContent = `#${u.rank ?? "-"}/${u.n_ranked}  mass ${(u.stats.mass ?? u.stats.z).toFixed(1)}  null ${(u.stats.null_pct * 100).toFixed(0)}%`;
   renderExamples(u);
   renderDetails(u);
   const hasRollouts = !!(u.rollouts && u.rollouts.length);
@@ -522,7 +551,7 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
 const isFocus = (layer, n, kind) => state.focus && state.focus.layer === layer && state.focus.n === n && state.focus.kind === kind;
 
 function renderExamples(u) {
-  if (!u.rollouts || !u.rollouts.length) { $("#tab-examples").innerHTML = `<div class="slot">—</div>`; return; }
+  if (!u.rollouts || !u.rollouts.length) { $("#tab-examples").innerHTML = `<div class="slot">-</div>`; return; }
   const prompts = Object.keys(u.prompts).filter(p => u.rollouts.some(r => r.prompt === p));
   const count = {};
   for (const r of u.rollouts) count[r.dose] = (count[r.dose] || 0) + 1;
@@ -557,7 +586,7 @@ function renderDetails(u) {
     h += `<table class="dtable"><tr><th class="num">dose</th><th class="num">push</th><th class="num">distinct-4</th><th class="num">capped</th><th class="num">logprob</th></tr>` +
       Object.entries(s.dose).map(([d, v]) => `<tr><td class="num">${d}</td><td class="num">${v.rel_push.toFixed(2)}</td><td class="num">${v.distinct4.toFixed(2)}</td><td class="num">${(v.capped * 100).toFixed(0)}%</td><td class="num">${v.logprob.toFixed(2)}</td></tr>`).join("") + `</table>`;
   }
-  h += `<div id="d-lens" class="slot">—</div><div class="lab" style="margin-top:18px">connections</div><div id="d-con" class="slot">—</div>`;
+  h += `<div id="d-lens" class="slot">-</div><div class="lab" style="margin-top:18px">connections</div><div id="d-con" class="slot">-</div>`;
   $("#tab-details").innerHTML = h;
 }
 

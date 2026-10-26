@@ -42,6 +42,13 @@ and [MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
 ## SOM research
 
+Open [the explorer's residuals view](http://127.0.0.1:8791/#residuals) to
+create matched conversation groups, capture full residual vectors, compare group
+measurements, and fit SOMs on training families. The workspace records token positions
+and model provenance and supports held-out candidate-answer checks. Its scripted
+example checks the workflow; it is not a sycophancy benchmark. See
+[the group workspace guide](docs/RESIDUAL_GROUPS.md) for capture points and artifact details.
+
 See [the research guide](docs/SOM_RESEARCH.md) for paired data collection, SOM fitting,
 projection interventions, baselines, and held-out evaluation. The SOM is a separate
 research method; the explorer's existing UMAP neuron layout is not a SOM.

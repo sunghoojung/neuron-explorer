@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Residual groups · Neuron Explorer</title>
+  <link rel="stylesheet" href="residuals.css?v=2">
+</head>
+<body class="residual-app">
+  <header class="topbar">
+    <a class="back-link" href="/" aria-label="Back to neuron explorer">← Explorer</a>
+    <span class="topbar-sep" aria-hidden="true"></span>
+    <span class="topbar-title">Residual groups</span>
+    <span class="topbar-status" id="global-status" role="status" aria-live="polite">Loading local settings…</span>
+  </header>
+
+  <main class="workspace">
+    <nav class="residual-tabs" id="residual-tabs" aria-label="Residual groups workspace">
+      <button type="button" data-residual-tab="groups" aria-pressed="true" class="on">groups</button>
+      <button type="button" data-residual-tab="capture" aria-pressed="false">capture</button>
+      <button type="button" data-residual-tab="streams" aria-pressed="false">streams</button>
+      <button type="button" data-residual-tab="som" aria-pressed="false">som</button>
+      <button type="button" data-residual-tab="probe" aria-pressed="false">probe</button>
+      <span class="residual-global-status" id="residual-view-status" role="status" aria-live="polite"></span>
+    </nav>
+    <section class="intro">
+      <div class="eyebrow">LOCAL WORKSPACE <span class="eyebrow-dot"></span> MATCHED CONVERSATIONS</div>
+      <h1>Residual groups</h1>
+      <p>Compare matched conversations across groups, capture their residual states, and explore a map of those states.</p>
+      <div class="notice" id="demo-notice">
+        <span class="notice-icon" aria-hidden="true">i</span>
+        <span><strong>Scripted example.</strong> The starting cases are fictional and are for checking the workflow only. A capture uses the selected text and the active local model.</span>
+      </div>
+    </section>
+
+    <section class="panel" data-residual-panel="groups" aria-labelledby="dataset-heading">
+      <div class="section-head">
+        <div class="step-mark">01</div>
+        <div class="section-title">
+          <h2 id="dataset-heading">Conversation set</h2>
+          <p>Keep each case matched across groups. Use <code>User:</code> and <code>Assistant:</code> to add turns.</p>
+        </div>
+        <div class="section-actions">
+          <button class="quiet-button" id="load-demo" type="button">Load scripted example</button>
+          <button class="quiet-button" id="add-case" type="button">＋ Add case</button>
+        </div>
+      </div>
+
+      <div class="dataset-toolbar">
+        <label class="field dataset-name-field">
+          <span>Set name</span>
+          <input id="dataset-name" type="text" maxlength="100" autocomplete="off" aria-label="Conversation set name">
+        </label>
+        <div class="dataset-actions">
+          <button class="quiet-button" id="export-json" type="button">Export JSON</button>
+          <button class="quiet-button" id="import-json-toggle" type="button" aria-expanded="false" aria-controls="import-json-panel">Import JSON</button>
+        </div>
+      </div>
+
+      <details class="advanced-panel" id="import-json-panel">
+        <summary>Advanced · import or paste a conversation set</summary>
+        <div class="advanced-body">
+          <p>JSON uses a <code>name</code> and a <code>samples</code> list. Each sample has an ID, pair, family, split, group, and role-tagged messages.</p>
+          <textarea id="json-import" rows="7" spellcheck="false" aria-label="Paste conversation set JSON" placeholder='{"name":"My set","samples":[{"id":"case-a-neutral","pair_id":"case-a","family_id":"family-a","split":"train","group":"Neutral","messages":[{"role":"user","content":"..."}]}]}'></textarea>
+          <div class="inline-actions">
+            <label class="file-button">Choose JSON file<input id="json-file" type="file" accept="application/json,.json"></label>
+            <button class="primary-button small" id="apply-json" type="button">Use this JSON</button>
+          </div>
+          <div class="field-message" id="import-message" role="status" aria-live="polite"></div>
+        </div>
+      </details>
+
+      <div class="group-header">
+        <div>
+          <div class="eyebrow">RESPONSE GROUPS</div>
+          <p class="microcopy">Each matched case needs one conversation in every group.</p>
+        </div>
+        <button class="quiet-button" id="add-group" type="button">＋ Add group</button>
+      </div>
+      <div class="group-list" id="group-list" aria-label="Response groups"></div>
+      <div class="case-list" id="case-list" aria-label="Matched conversation cases"></div>
+      <div class="dataset-footer">
+        <div id="dataset-summary" class="dataset-summary" role="status" aria-live="polite"></div>
+        <button class="quiet-button" id="validate-dataset" type="button">Check this set</button>
+      </div>
+      <div id="dataset-validation" class="validation-message" aria-live="polite"></div>
+      <div class="local-note"><span aria-hidden="true">●</span> Draft stays in this browser until you start a capture.</div>
+    </section>
+
+    <section class="panel" data-residual-panel="capture" aria-labelledby="capture-heading" hidden>
+      <div class="section-head">
+        <div class="step-mark">02</div>
+        <div class="section-title">
+          <h2 id="capture-heading">Capture residual states</h2>
+          <p>Run the selected conversations through the active local model and record a small window of token states.</p>
+        </div>
+        <div class="runtime-chip" id="runtime-chip">Checking model…</div>
+      </div>
+
+      <div class="capture-layout">
+        <div class="capture-controls">
+          <fieldset class="control-fieldset">
+            <legend>Layers</legend>
+            <div class="check-row" id="layer-options" aria-label="Capture layers"></div>
+            <details class="advanced-panel compact" id="all-layer-panel" hidden>
+              <summary>Advanced · choose other layers</summary>
+              <div class="check-row advanced-layer-options" id="all-layer-options" aria-label="Other available layers"></div>
+            </details>
+            <div class="microcopy" id="layer-help">Choose one or more layers.</div>
+          </fieldset>
+          <fieldset class="control-fieldset">
+            <legend>Where to read the state</legend>
+            <div class="point-options" id="point-options" aria-label="Capture points"></div>
+          </fieldset>
+          <label class="field window-field">
+            <span>Last tokens to keep</span>
+            <select id="capture-window" aria-label="Number of ending tokens to capture">
+              <option value="4">4 tokens</option>
+              <option value="8" selected>8 tokens</option>
+              <option value="12">12 tokens</option>
+              <option value="16">16 tokens</option>
+            </select>
+          </label>
+          <div class="capture-actions">
+            <button class="primary-button" id="start-capture" type="button">Capture conversations</button>
+            <button class="quiet-button danger-button" id="cancel-capture" type="button" hidden>Cancel</button>
+          </div>
+          <div id="capture-message" class="job-message" role="status" aria-live="polite">No capture yet. The scripted example does not include model results.</div>
+          <div class="progress-wrap" id="capture-progress-wrap" hidden>
+            <div class="progress-label"><span id="capture-stage">Waiting</span><span id="capture-progress-text">0%</span></div>
+            <progress id="capture-progress" max="100" value="0">0%</progress>
+          </div>
+        </div>
+        <div class="capture-aside">
+          <div class="aside-kicker">CURRENT MODEL</div>
+          <div class="model-title" id="model-title">Waiting for local model details</div>
+          <div class="model-copy" id="model-copy">Capture controls will be checked against the active model before a run starts.</div>
+          <details class="advanced-panel compact" id="provenance-panel">
+            <summary>Advanced · model and capture details</summary>
+            <dl class="provenance-list" id="model-provenance"></dl>
+          </details>
+          <p class="safety-note">Only conversations in this set are sent to the local capture workflow. No private dataset is selected automatically.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel results-panel" id="capture-results" data-residual-panel="streams" aria-labelledby="results-heading" hidden>
+      <div class="section-head">
+        <div class="step-mark">03</div>
+        <div class="section-title">
+          <h2 id="results-heading">Captured states</h2>
+          <p>Compare the groups and inspect token positions. Token positions are relative to each conversation, not aligned across different prompts.</p>
+        </div>
+        <div class="capture-badge" id="capture-badge">No capture</div>
+      </div>
+      <div class="empty-state" id="capture-empty">
+        <div class="empty-glyph" aria-hidden="true">···</div>
+        <strong>Capture a set to see its measurements</strong>
+        <span>Group summaries, paired comparisons, and token strips will appear here after a completed capture.</span>
+      </div>
+      <div id="capture-view" hidden>
+        <div class="result-toolbar">
+          <label class="field compact-field"><span>Saved capture</span><select id="capture-choice"></select></label>
+          <label class="field compact-field"><span>Layer</span><select id="metrics-layer"></select></label>
+          <label class="field compact-field"><span>State point</span><select id="metrics-point"></select></label>
+          <label class="field compact-field"><span>Compare</span><select id="group-a"></select></label>
+          <span class="compare-word" aria-hidden="true">with</span>
+          <label class="field compact-field"><span class="sr-only">Compare against</span><select id="group-b"></select></label>
+          <button class="quiet-button" id="refresh-summary" type="button">Refresh</button>
+        </div>
+        <div class="metric-grid">
+          <article class="metric-card">
+            <div class="card-kicker">GROUP MEANS</div>
+            <h3>State size by layer</h3>
+            <p class="microcopy">L2 norm and RMS are descriptive measurements, not behavior scores.</p>
+            <div id="group-metrics" class="group-metrics"></div>
+          </article>
+          <article class="metric-card compare-card">
+            <div class="card-kicker">MATCHED CASES</div>
+            <h3>Group difference</h3>
+            <p class="microcopy">Centroid cosine and delta norm summarize the selected pair at each captured layer.</p>
+            <div id="pair-metrics" class="pair-metrics"></div>
+          </article>
+        </div>
+        <article class="metric-card token-card">
+          <div class="token-heading">
+            <div><div class="card-kicker">TOKEN VIEW</div><h3>Ending positions for each conversation</h3></div>
+            <div class="token-legend"><span class="legend-mark"></span> Last token is position 0</div>
+          </div>
+          <div id="token-strips" class="token-strips"></div>
+        </article>
+        <details class="advanced-panel compact result-provenance">
+          <summary>Advanced · capture provenance</summary>
+          <dl class="provenance-list" id="capture-provenance"></dl>
+        </details>
+      </div>
+      <div class="validation-message" id="summary-message" aria-live="polite"></div>
+    </section>
+
+    <section class="panel fit-panel" data-residual-panel="som" aria-labelledby="fit-heading" hidden>
+      <div class="section-head">
+        <div class="step-mark">04</div>
+        <div class="section-title">
+          <h2 id="fit-heading">Explore a map</h2>
+          <p>Fit a small self-organizing map using training families only, then inspect the descriptive geometry of held-out cases.</p>
+        </div>
+        <div class="capture-badge" id="fit-badge">Needs capture</div>
+      </div>
+      <div class="fit-layout">
+        <div class="fit-controls">
+          <label class="field"><span>Capture</span><select id="capture-for-fit" disabled></select></label>
+          <label class="field"><span>Fit on</span><select id="fit-mode"><option value="states">Captured states</option><option value="paired_delta">Difference between selected groups</option></select></label>
+          <label class="field"><span>Layer</span><select id="fit-layer"></select></label>
+          <label class="field"><span>State point</span><select id="fit-point"></select></label>
+          <div class="two-fields">
+            <label class="field"><span>Rows</span><select id="fit-rows"><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>8</option></select></label>
+            <label class="field"><span>Columns</span><select id="fit-cols"><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>8</option></select></label>
+          </div>
+          <div class="two-fields">
+            <label class="field"><span>Training passes</span><input id="fit-epochs" type="number" min="1" max="500" value="100"></label>
+            <label class="field"><span>Seed</span><input id="fit-seed" type="number" min="0" max="2147483647" value="0"></label>
+          </div>
+          <label class="field"><span>Scale each state</span><select id="fit-normalize"><option value="none">Keep original size</option><option value="unit">Normalize to unit length</option></select></label>
+          <div class="paired-fields">
+            <label class="field"><span>Group A</span><select id="fit-group-a"></select></label>
+            <label class="field"><span>Group B</span><select id="fit-group-b"></select></label>
+          </div>
+          <button class="primary-button" id="start-fit" type="button" disabled>Fit map from capture</button>
+          <div class="microcopy">Fitting uses only training families. Cell placement and quantization describe geometry, not behavior or correctness.</div>
+          <button class="quiet-button danger-button" id="cancel-fit" type="button" hidden>Cancel map fitting</button>
+          <div class="job-message" id="fit-message" role="status" aria-live="polite">A completed capture is needed before fitting.</div>
+          <div class="progress-wrap" id="fit-progress-wrap" hidden><div class="progress-label"><span id="fit-stage">Waiting</span><span id="fit-progress-text">0%</span></div><progress id="fit-progress" max="100" value="0">0%</progress></div>
+        </div>
+        <div class="fit-results">
+          <div id="fit-empty" class="empty-state compact-empty"><div class="empty-glyph" aria-hidden="true">⌘</div><strong>No map yet</strong><span>Map cells and held-out measurements appear after fitting.</span></div>
+          <div id="fit-view" hidden>
+            <div class="map-toolbar">
+              <div><div class="card-kicker">MAP CELLS</div><h3 id="fit-title">Fitted map</h3></div>
+              <label class="field compact-field"><span>Saved fit</span><select id="fit-choice"></select></label>
+              <label class="field compact-field"><span>Color by</span><select id="fit-color"><option value="group">Group</option><option value="split">Data split</option></select></label>
+              <label class="field compact-field"><span>Show</span><select id="fit-split"><option value="all">All splits</option><option value="train">Train</option><option value="validation">Validation</option><option value="test">Test</option></select></label>
+            </div>
+            <div class="map-with-legend"><div id="som-grid" class="som-grid" role="grid" aria-label="Self-organizing map cells"></div><div id="map-legend" class="map-legend"></div></div>
+            <div class="fit-stats" id="fit-stats"></div>
+            <div class="cell-detail" id="cell-detail"><span class="dim">Choose a cell to inspect its assigned cases.</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel probe-panel" data-residual-panel="probe" aria-labelledby="probe-heading" hidden>
+      <div class="section-head">
+        <div class="step-mark">05</div>
+        <div class="section-title">
+          <h2 id="probe-heading">Optional candidate check</h2>
+          <p>Compare how a global SOM prototype subspace changes preference between user-entered target and foil words on held-out cases.</p>
+        </div>
+        <div class="capture-badge" id="probe-badge">Optional</div>
+      </div>
+      <div class="probe-layout">
+        <div class="probe-controls">
+          <label class="field"><span>Held-out split</span><select id="probe-split"><option value="test">Test</option><option value="validation">Validation</option></select></label>
+          <label class="field"><span>Strength</span><input id="probe-alpha" type="number" min="0" max="1" step="0.1" value="0.5"></label>
+          <label class="field"><span>Maximum cases</span><select id="probe-max"><option>4</option><option selected>8</option></select></label>
+          <button class="primary-button" id="start-probe" type="button" disabled>Compare candidate preference</button>
+          <button class="quiet-button danger-button" id="cancel-probe" type="button" hidden>Cancel check</button>
+          <div class="job-message" id="probe-message" role="status" aria-live="polite">Requires a fitted map and user-entered target and foil for held-out cases.</div>
+          <div class="progress-wrap" id="probe-progress-wrap" hidden><div class="progress-label"><span id="probe-stage">Waiting</span><span id="probe-progress-text">0%</span></div><progress id="probe-progress" max="100" value="0">0%</progress></div>
+        </div>
+        <div class="probe-results">
+          <div class="probe-caveat">This is a global SOM prototype-subspace removal check for a paired-difference map, not a cell-local intervention. Margins are candidate preferences, not accuracy or evidence that a response is correct. Compare with zero, global mean, PCA, and random controls.</div>
+          <div id="probe-empty" class="empty-state compact-empty"><div class="empty-glyph" aria-hidden="true">↔</div><strong>No candidate check yet</strong><span>Enter target and foil words in the matched cases before running this optional check.</span></div>
+          <div id="probe-view" hidden><div class="probe-result-list" id="probe-results-list"></div></div>
+        </div>
+      </div>
+    </section>
+    <footer class="page-footer"><a href="/">← Back to neuron explorer</a><span>Local conversation workspace · results are exploratory</span></footer>
+  </main>
+  <script type="module" src="residuals.js?v=2"></script>
+</body>
+</html>

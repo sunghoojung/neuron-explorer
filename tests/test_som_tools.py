@@ -606,7 +606,7 @@ def test_native_report_behavior_links_return_only_validated_aggregates(monkeypat
 
 
 def test_native_report_asset_and_behavior_link_paths_are_registered():
-    paths = {route.path for route in server.app.routes}
+    paths = {route.path for route in server.app.routes if hasattr(route, "path")}
 
     assert "/api/agent/som/native-reports/{native_id}/report" in paths
     assert "/api/agent/som/native-reports/{native_id}/maps/{map_name}/map.png" in paths
