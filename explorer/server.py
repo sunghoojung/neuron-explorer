@@ -46,6 +46,7 @@ from model_adapter import (
 if os.environ.get("EXPLORER_MODEL") == DEFAULT_MODEL:
     os.environ.setdefault("EXPLORER_REVISION", DEFAULT_REVISION)
 from chatgpt_backend import ChatGPTBackend, ChatHistoryError
+from atlas_api import create_atlas_router
 from rank import compute_units
 from residual_api import create_residual_router
 from runtime import NO_MODEL, Runtime
@@ -106,6 +107,7 @@ rt = Runtime(STATS_ROOT)
 som_service = SOMService(repo_root=ROOT)
 residual_router, residual_service = create_residual_router(rt, ROOT)
 app.include_router(residual_router)
+app.include_router(create_atlas_router(ROOT))
 
 
 def current_model_info():

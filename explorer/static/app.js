@@ -1,6 +1,7 @@
 import { createMap } from "./map3d.js?v=71";
 import { createScatter } from "./scatter.js?v=39";
 import { createResidualMap } from "./residual-map.js?v=1";
+import { createAtlasView } from "./atlas-view.js?v=1";
 
 const $ = s => document.querySelector(s);
 const api = async (p, body) => {
@@ -14,6 +15,13 @@ const fmtDose = d => (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d);
 
 let agentSelecting = false, agentMarked = false;  // ChatGPT's selections and marks (see agentUi); declared early, openNeuron reads them on load
 const state = { layer: null, units: {}, unitMap: {}, focus: null, view: "map", chat: { mode: "add", dir: "writes", dose: { add: 0.8, mul: 2 } } };
+const atlasView = createAtlasView({
+  root: document.querySelector("#atlas-view"),
+  onSectionChange: section => {
+    if (state.view === "atlas" && location.hash !== `#atlas/${section}`)
+      history.replaceState(null, "", `${location.pathname}${location.search}#atlas/${section}`);
+  },
+});
 let mapResidualMode = false, residualMap = null, mapUiReady = false;
 const ADD_STEPS = [...Array.from({ length: 30 }, (_, i) => +((i + 1) * 0.05).toFixed(2)), 1.75, 2, 2.5, 3, 4, 5];
 const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12, 16];
@@ -166,15 +174,22 @@ document.querySelectorAll("#views button").forEach(b => b.onclick = () => setVie
 let residualWorkspacePromise = null;
 function setView(v) {
   state.view = v;
+  const isAtlas = v === "atlas";
   document.body.classList.toggle("residual-open", v === "residuals");
+  document.body.classList.toggle("atlas-open", isAtlas);
   if (v === "residuals" && location.hash !== "#residuals") history.replaceState(null, "", `${location.pathname}${location.search}#residuals`);
   if (v !== "residuals" && location.hash === "#residuals") history.replaceState(null, "", `${location.pathname}${location.search}`);
+  if (isAtlas && location.hash !== `#atlas/${atlasView.getSection()}`) history.replaceState(null, "", `${location.pathname}${location.search}#atlas/${atlasView.getSection()}`);
+  if (!isAtlas && location.hash.startsWith("#atlas")) history.replaceState(null, "", `${location.pathname}${location.search}`);
   document.querySelectorAll("#views button").forEach(x => x.classList.toggle("on", x.dataset.view === v));
   $("#map-view").classList.toggle("on", v === "map");
   $("#embed-view").classList.toggle("on", v === "embed");
   $("#residuals-view").classList.toggle("on", v === "residuals");
+  $("#atlas-view").classList.toggle("on", isAtlas);
   if (v === "embed") loadEmbeddings();
   if (v === "residuals") loadResidualWorkspace();
+  if (isAtlas) atlasView.activate();
+  else atlasView.deactivate();
   $("#map-kind").hidden = v !== "map";
   syncMapRepresentation();
 }
@@ -198,6 +213,11 @@ document.querySelectorAll("#map-kind button").forEach(button => button.onclick =
   syncMapRepresentation();
 });
 if (location.hash === "#residuals") setView("residuals");
+else if (/^#atlas(?:\/(groups|behavior))?$/.test(location.hash)) {
+  const section = location.hash.split("/")[1] || "groups";
+  atlasView.setSection(section, false);
+  setView("atlas");
+}
 function loadResidualWorkspace() {
   if (residualWorkspacePromise) return residualWorkspacePromise;
   residualWorkspacePromise = (async () => {
@@ -483,6 +503,8 @@ addEventListener("hashchange", fromHash);
 function fromHash() {
   if (location.hash === "#states") { mapResidualMode = true; setView("map"); return; }
   if (location.hash === "#residuals") { setView("residuals"); return; }
+  const atlasHash = location.hash.match(/^#atlas(?:\/(groups|behavior))?$/);
+  if (atlasHash) { atlasView.setSection(atlasHash[1] || "groups", false); setView("atlas"); return; }
   const m = location.hash.match(/^#L(\d+)\/N(\d+)/);
   if (m && !(state.focus && state.focus.layer === +m[1] && state.focus.n === +m[2])) openNeuron(+m[1], +m[2], "neuron", false);
 }

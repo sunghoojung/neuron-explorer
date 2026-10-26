@@ -257,7 +257,7 @@ function persistDraft() {
       probeId: state.probeId,
       jobs: state.activeJobs,
     }));
-    setText("global-status", state.config?.model?.revision ? "Draft saved · local model ready" : "Draft saved on this device");
+    setText("global-status", state.config?.model?.loaded ? "Draft saved · local model ready" : "Draft saved · model not loaded");
   } catch {
     setText("global-status", "Draft could not be saved in this browser");
   }
@@ -690,6 +690,7 @@ function updateConfig(config) {
     model_id: raw.model_id,
     revision: raw.revision,
     device: raw.device,
+    loaded: raw.loaded === true,
     hidden_size: raw.hidden_size,
     n_layers: raw.num_layers ?? raw.n_layers,
   };
