@@ -6,6 +6,7 @@
 <title>Neuron Explorer</title>
 <link rel="stylesheet" href="style.css?v=68">
 <link rel="stylesheet" href="residual-map.css?v=1">
+<link rel="stylesheet" href="atlas.css?v=1">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%23151515%22/%3E%3Ccircle cx=%228%22 cy=%228%22 r=%222.5%22 fill=%22%23ffd27a%22/%3E%3C/svg%3E">
 <script type="importmap">
 {"imports": {
@@ -20,6 +21,7 @@
     <button data-view="map" class="on">map</button>
     <button data-view="embed">embeddings</button>
     <button data-view="residuals">residuals</button>
+    <button data-view="atlas">atlas</button>
   </nav>
   <span id="model-id" class="mono" aria-label="model"></span>
   <span class="seg" id="map-kind" aria-label="Map representation"><button data-map-kind="neurons" class="on">neurons</button><button data-map-kind="residuals">states</button></span>
@@ -51,6 +53,52 @@
   </section>
   <section id="residuals-view" class="view residual-app native-mode">
     <div id="residuals-host" class="residuals-host" aria-live="polite"><div class="residuals-loading">Opening residual groups…</div></div>
+  </section>
+  <section id="atlas-view" class="view atlas-app" aria-label="Teacher-forced activation atlas">
+    <div class="atlas-shell">
+      <div class="atlas-heading">
+        <div>
+          <div class="atlas-eyebrow">sycophancy atlas</div>
+          <h1>Scripted activation maps</h1>
+        </div>
+        <nav id="atlas-subnav" aria-label="Atlas views">
+          <button data-atlas-view="groups" class="on">groups</button>
+          <button data-atlas-view="behavior">behavior</button>
+        </nav>
+      </div>
+      <p class="atlas-caveat"><b>Supplied scripts:</b> these maps show conditional activations, not spontaneous responses.</p>
+      <p id="atlas-provenance-note" class="atlas-caveat atlas-synthetic-note" hidden></p>
+      <div id="atlas-load-state" class="atlas-load-state" role="status" aria-live="polite">Atlas data has not been loaded.</div>
+      <div id="atlas-groups-panel" class="atlas-panel">
+        <div class="atlas-controls" aria-label="Atlas map controls">
+          <label>atlas<select id="atlas-select" aria-label="atlas"></select></label>
+          <label>layer<select id="atlas-layer" aria-label="atlas layer"></select></label>
+          <label>map<select id="atlas-map-view" aria-label="map measure"></select></label>
+          <label>seed<select id="atlas-seed" aria-label="map seed"></select></label>
+          <label>split<select id="atlas-split" aria-label="data split"><option value="train">train</option><option value="eval">eval</option></select></label>
+          <label>color<select id="atlas-color-mode" aria-label="cell coloring"><option value="dominant">dominant group</option><option value="density">group share</option></select></label>
+          <label id="atlas-density-wrap" hidden>group<select id="atlas-density-group" aria-label="group share"></select></label>
+          <label>script<select id="atlas-stance" aria-label="teacher-written script"><option value="all">all scripts</option><option value="approval_seeking_script">candidate script</option><option value="independent_script">reference script</option></select></label>
+        </div>
+        <div class="atlas-layout">
+          <div class="atlas-map-card">
+            <div class="atlas-map-heading"><div><h2 id="atlas-map-title">Group map</h2><div id="atlas-map-meta" class="atlas-dim"></div></div><div id="atlas-map-count" class="atlas-mono"></div></div>
+            <svg id="atlas-hexmap" viewBox="0 0 440 400" role="group" aria-label="Six by six hexagonal self-organizing map"></svg>
+            <p id="atlas-map-key" class="atlas-dim" style="font-size:11px;margin:0"></p>
+            <div id="atlas-map-empty" class="atlas-empty" hidden>No map is available for these settings.</div>
+          </div>
+          <aside class="atlas-side">
+            <section class="atlas-card atlas-cell-card"><h2 id="atlas-cell-title">Select a cell</h2><div id="atlas-cell-detail" class="atlas-cell-detail"><p class="atlas-dim">Choose a hexagon to inspect its group composition and scripted examples.</p></div></section>
+            <section class="atlas-card"><h2>Groups</h2><div id="atlas-legend" class="atlas-legend"></div></section>
+            <section class="atlas-card"><h2>Coverage</h2><div id="atlas-coverage" class="atlas-coverage"></div></section>
+
+          </aside>
+        </div>
+      </div>
+      <div id="atlas-behavior-panel" class="atlas-panel" hidden>
+        <div id="atlas-behavior-content" class="atlas-behavior-content"></div>
+      </div>
+    </div>
   </section>
 
   <aside id="list" class="float">
@@ -111,6 +159,6 @@
     </div>
   </aside>
 </main>
-<script type="module" src="app.js?v=106"></script>
+<script type="module" src="app.js?v=107"></script>
 </body>
 </html>
