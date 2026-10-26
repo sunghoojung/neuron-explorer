@@ -155,13 +155,18 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"neurons": {"type": "array", "items": {
          "type": "object", "properties": {**LN, "sign": {"type": "string", "enum": ["+", "-"]}},
          "required": ["layer", "n"]}}}, "required": ["neurons"]}},
-    {"name": "som_status", "description": "Inspect the configured SOM workflow, paired-prompt sources, validated artifacts, and persisted jobs. "
+    {"name": "som_status", "description": "Inspect the configured SOM workflow, paired-prompt sources, validated decoder-residual artifacts, read-only native SOM reports, and persisted jobs. "
      "Shows existing private experiment records separately from the bundled example source when configured. Returns safe summaries and opaque IDs, not file contents or local paths.",
      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"name": "som_read_artifact", "description": "Read the validated metadata and provenance for one existing SOM artifact using its opaque artifact_id from som_status. "
      "Does not return prototypes, activation data, or arbitrary files.",
      "inputSchema": {"type": "object", "properties": {"artifact_id": {"type": "string", "minLength": 1, "maxLength": 128}},
                      "required": ["artifact_id"], "additionalProperties": False}},
+    {"name": "som_read_native_report", "description": "Read a compact status, provenance, behavior, and map summary for a configured native SOM run using its opaque native_id from som_status. Includes integrity and capture-provenance state. The default keeps brief records for each map; add map_name to get one map's detailed aggregate geometry/association summary. map_name must exactly match one listed map. The report URL opens the sandboxed atlas. Native directions are read-only metadata and are not applied to the decoder-residual hook or live model. No raw direction arrays, per-example records, local paths, or arbitrary files are returned.",
+     "inputSchema": {"type": "object", "properties": {
+         "native_id": {"type": "string", "minLength": 1, "maxLength": 128},
+         "map_name": {"type": "string", "minLength": 1, "maxLength": 120}},
+                     "required": ["native_id"], "additionalProperties": False}},
     {"name": "som_run_pilot", "description": "Only invoke when the person explicitly requests a run. Queue one bounded local SOM pilot over a configured paired-prompt source from som_status. Collection captures paired residual activations and rejects sources larger than 24 question IDs (96 condition records); fitting trains only on train-split false_pressure minus neutral deltas; evaluation checks the requested held-out split against controls and is capped separately by max_questions. Uses the active model's exact revision and device, usually MPS on Apple Silicon. This exploratory pilot is not research proof; a run from the bundled example source is a plumbing check only. The server validates the source and layer, writes only under its managed run root, and reports progress through som_job_status. No shell command or filesystem path is accepted.",
      "inputSchema": {"type": "object", "properties": {
          "source_id": {"type": "string", "minLength": 1, "maxLength": 128}, "layer": {"type": "integer", "minimum": 0},
@@ -207,6 +212,33 @@ def get(path, **q):
 def post(path, body, timeout=60):
     req = urllib.request.Request(f"{URL}{path}", json.dumps(body).encode(), {"Content-Type": "application/json"})
     return _request_json(req, timeout=timeout)
+
+
+def _compact_native_report(report, selected_map_name=None):
+    if not isinstance(report, dict):
+        raise TypeError("Explorer returned an invalid native SOM report summary")
+    maps = report.get("maps")
+    if not isinstance(maps, list):
+        raise TypeError("Explorer returned no native SOM map index")
+    brief_fields = ("map_name", "kind", "view", "layer", "side", "seed", "prototype_count")
+    compact = dict(report)
+    compact["maps"] = [
+        {key: item[key] for key in brief_fields if key in item}
+        for item in maps
+        if isinstance(item, dict)
+    ]
+    if selected_map_name is not None:
+        if not isinstance(selected_map_name, str) or not 1 <= len(selected_map_name) <= 120:
+            raise ValueError("map_name must be an exact listed map name")
+        selected = next(
+            (item for item in maps if isinstance(item, dict) and item.get("map_name") == selected_map_name),
+            None,
+        )
+        if selected is None:
+            available = ", ".join(item["map_name"] for item in compact["maps"] if "map_name" in item)
+            raise ValueError(f"Unknown map_name. Choose one listed in som_status: {available}")
+        compact["selected_map_detail"] = selected
+    return compact
 
 
 def call(name, a):
@@ -262,6 +294,9 @@ def call(name, a):
         return get("/api/agent/som/status")
     if name == "som_read_artifact":
         return get("/api/agent/som/artifact", artifact_id=a["artifact_id"])
+    if name == "som_read_native_report":
+        report = get("/api/agent/som/native-report", native_id=a["native_id"])
+        return _compact_native_report(report, a.get("map_name"))
     if name == "som_run_pilot":
         return post("/api/agent/som/pilot", a)
     if name == "som_job_status":

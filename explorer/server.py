@@ -3,15 +3,21 @@
     uv run python explorer/server.py            # http://localhost:8791
 """
 import asyncio
+import base64
 import builtins
 import glob
+import hashlib
+import html
 import json
 import os
+import re
 import sys
 import threading
 from contextlib import asynccontextmanager
+from html.parser import HTMLParser
 from math import ceil, sqrt
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 import uvicorn
@@ -41,7 +47,13 @@ if os.environ.get("EXPLORER_MODEL") == DEFAULT_MODEL:
 from chatgpt_backend import ChatGPTBackend, ChatHistoryError
 from rank import compute_units
 from runtime import NO_MODEL, Runtime
-from som_service import SOMService, SOMServiceError
+from som_service import (
+    MAX_NATIVE_MAP_PNG_BYTES,
+    MAX_NATIVE_MAPS,
+    MAX_NATIVE_REPORT_BYTES,
+    SOMService,
+    SOMServiceError,
+)
 
 PORT = int(os.environ.get("PORT", "8791"))
 RUNS_ROOT, STATS_ROOT = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
@@ -799,6 +811,316 @@ def _som_error_response(exc):
     return JSONResponse({"error": "SOM service request failed."}, status_code=500)
 
 
+def _native_report_url(native_id):
+    return f"/api/agent/som/native-reports/{quote(native_id, safe='')}/report"
+
+
+MAX_NATIVE_EMBEDDED_ATLAS_BYTES = 32 * 1024 * 1024
+
+
+class _NativeAtlasRewriter(HTMLParser):
+    """Rewrite only validated map and behavior references into self-contained content."""
+
+    def __init__(self, image_data_uris):
+        super().__init__(convert_charrefs=False)
+        self.image_data_uris = image_data_uris
+        self.parts = []
+        self.embedded_images = set()
+        self.strict_links = 0
+        self.review_links = 0
+        self.skipped_anchor_depth = 0
+
+    def _start_tag(self, tag, attrs, self_closing=False):
+        if self.skipped_anchor_depth:
+            if tag == "a":
+                self.skipped_anchor_depth += 1
+            return
+
+        attr_values = dict(attrs)
+        if tag == "a" and attr_values.get("href") == "behavior/blinded-review.json":
+            self.parts.append('<a href="#blinded-review-summary">Semantic review status</a>')
+            self.review_links += 1
+            self.skipped_anchor_depth = 1
+            return
+
+        rendered_attrs = []
+        for name, value in attrs:
+            if name == "srcset":
+                raise ValueError("native report contains an unsupported image reference")
+            if tag == "img" and name == "src":
+                if not isinstance(value, str):
+                    raise ValueError("native report image reference is invalid")
+                if value.startswith("maps/"):
+                    data_uri = self.image_data_uris.get(value)
+                    if data_uri is None:
+                        raise ValueError("native report references an unlisted map image")
+                    self.embedded_images.add(value)
+                    value = data_uri
+                elif not value.lower().startswith("data:image/"):
+                    raise ValueError("native report contains a non-embedded image")
+            elif tag == "a" and name == "href":
+                if value == "behavior/strict-screen.json":
+                    value = "#strict-screen-summary"
+                    self.strict_links += 1
+                elif value and not value.startswith("#"):
+                    raise ValueError("native report contains an unsupported link")
+            if value is None:
+                rendered_attrs.append(f" {name}")
+            else:
+                rendered_attrs.append(f' {name}="{html.escape(value, quote=True)}"')
+        suffix = "/" if self_closing else ""
+        self.parts.append(f"<{tag}{''.join(rendered_attrs)}{suffix}>")
+
+    def handle_starttag(self, tag, attrs):
+        self._start_tag(tag, attrs)
+
+    def handle_startendtag(self, tag, attrs):
+        self._start_tag(tag, attrs, self_closing=True)
+
+    def handle_endtag(self, tag):
+        if self.skipped_anchor_depth:
+            if tag == "a":
+                self.skipped_anchor_depth -= 1
+            return
+        self.parts.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if not self.skipped_anchor_depth:
+            self.parts.append(data)
+
+    def handle_entityref(self, name):
+        if not self.skipped_anchor_depth:
+            self.parts.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if not self.skipped_anchor_depth:
+            self.parts.append(f"&#{name};")
+
+    def handle_comment(self, data):
+        if not self.skipped_anchor_depth:
+            self.parts.append(f"<!--{data}-->")
+
+    def handle_decl(self, decl):
+        if not self.skipped_anchor_depth:
+            self.parts.append(f"<!{decl}>")
+
+    def unknown_decl(self, data):
+        if not self.skipped_anchor_depth:
+            self.parts.append(f"<![{data}]>")
+
+    def handle_pi(self, data):
+        if not self.skipped_anchor_depth:
+            self.parts.append(f"<?{data}>")
+
+
+class _FirstBodyContentTag(HTMLParser):
+    _HEAD_TAGS = frozenset({"meta", "title", "style", "base", "link", "script", "noscript", "template"})
+
+    def __init__(self, source):
+        super().__init__(convert_charrefs=False)
+        self.source = source
+        self.index = None
+
+    def handle_starttag(self, tag, _attrs):
+        if self.index is None and tag not in self._HEAD_TAGS:
+            line, column = self.getpos()
+            self.index = sum(len(part) for part in self.source.splitlines(keepends=True)[:line - 1]) + column
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+
+def _native_report_behavior_payload(report, kind):
+    if (
+        not isinstance(report, dict)
+        or report.get("status") != "completed"
+        or report.get("integrity_status") != "verified"
+    ):
+        raise ValueError("No validated native SOM behavior summary was found.")
+    behavior = report.get("behavior")
+    if not isinstance(behavior, dict):
+        raise TypeError("No validated native SOM behavior summary was found.")
+    if kind == "strict-screen":
+        summary = behavior.get("strict_screen")
+        if not isinstance(summary, dict):
+            raise ValueError("No validated native SOM behavior summary was found.")
+        return summary
+    review_status = behavior.get("semantic_review_status")
+    grade_count = behavior.get("semantic_grade_count")
+    if (
+        not isinstance(review_status, str)
+        or isinstance(grade_count, bool)
+        or not isinstance(grade_count, int)
+        or grade_count < 0
+    ):
+        raise ValueError("No validated native SOM behavior summary was found.")
+    return {"semantic_review_status": review_status, "semantic_grade_count": grade_count}
+
+
+def _native_report_summary_banner(report):
+    geometry = report.get("geometry", {})
+    behavior = report.get("behavior", {})
+    if not isinstance(geometry, dict) or not isinstance(behavior, dict):
+        raise TypeError("Native SOM summary is incomplete")
+
+    def count(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    map_count = count(geometry.get("map_count"))
+    pairs = count(geometry.get("pairs"))
+    cases = count(behavior.get("cases"))
+    arms = count(behavior.get("arms"))
+    answers = count(behavior.get("answers"))
+    grade_count = count(behavior.get("semantic_grade_count"))
+    review_status = behavior.get("semantic_review_status")
+    integrity = report.get("integrity_status")
+    capture = report.get("capture_provenance_status")
+    state = "Integrity and capture provenance verified" if integrity == "verified" and capture == "verified" else f"Integrity: {integrity}; capture provenance: {capture}"
+    counts = []
+    for label, value in (("maps", map_count), ("pairs", pairs), ("cases", cases), ("arms", arms), ("answers", answers)):
+        if value is not None:
+            counts.append(f"{value:,} {label}")
+    review = "Semantic review status unavailable"
+    if isinstance(review_status, str):
+        review = f"Semantic grading: {review_status}"
+        if grade_count is not None:
+            review += f"; graded items: {grade_count:,}"
+    return (
+        '<aside class="som-run-summary" aria-label="Validated run summary">'
+        f"<strong>{html.escape(state)}</strong>"
+        f"<p>{html.escape(' · '.join(counts))}</p>"
+        f"<p>{html.escape(review)}</p>"
+        "</aside>"
+    )
+
+
+def _native_report_behavior_sections(report):
+    strict = _native_report_behavior_payload(report, "strict-screen")
+    review = _native_report_behavior_payload(report, "blinded-review")
+    strict_json = html.escape(json.dumps(strict, ensure_ascii=False, indent=2))
+    review_json = html.escape(json.dumps(review, ensure_ascii=False, indent=2))
+    return (
+        '<section id="strict-screen-summary" class="som-derived-summary">'
+        "<h2>Strict-screen summary</h2>"
+        f"<pre>{strict_json}</pre></section>"
+        '<section id="blinded-review-summary" class="som-derived-summary">'
+        "<h2>Semantic review status</h2>"
+        f"<pre>{review_json}</pre></section>"
+    )
+
+
+def _render_native_atlas(native_id, report, report_path):
+    report_bytes = report_path.read_bytes()
+    expected_report_hash = report.get("geometry", {}).get("report_sha256")
+    if (
+        len(report_bytes) > MAX_NATIVE_REPORT_BYTES
+        or not isinstance(expected_report_hash, str)
+        or hashlib.sha256(report_bytes).hexdigest() != expected_report_hash
+    ):
+        raise ValueError("Validated native SOM report changed before rendering")
+    source = report_bytes.decode("utf-8")
+    maps = report.get("maps")
+    if not isinstance(maps, list) or len(maps) > MAX_NATIVE_MAPS:
+        raise ValueError("Native SOM map index is invalid")
+
+    image_data_uris = {}
+    estimated_bytes = len(report_bytes)
+    for item in maps:
+        if not isinstance(item, dict):
+            raise TypeError("Native SOM map index is invalid")
+        map_name = item.get("map_name")
+        digest = item.get("png_sha256")
+        if not isinstance(map_name, str) or not isinstance(digest, str):
+            raise TypeError("Native SOM map index is invalid")
+        relative_name = f"maps/{map_name}/map.png"
+        asset_path = som_service.get_native_report_asset(native_id, relative_name)
+        if asset_path is None:
+            raise ValueError("A validated native SOM map image is unavailable")
+        asset_size = asset_path.stat().st_size
+        if asset_size > MAX_NATIVE_MAP_PNG_BYTES:
+            raise OverflowError("Native SOM atlas is too large to render safely")
+        encoded_size = ((asset_size + 2) // 3) * 4
+        estimated_bytes += encoded_size + len("data:image/png;base64,")
+        if estimated_bytes > MAX_NATIVE_EMBEDDED_ATLAS_BYTES:
+            raise OverflowError("Native SOM atlas is too large to render safely")
+        image_bytes = asset_path.read_bytes()
+        if (
+            len(image_bytes) > MAX_NATIVE_MAP_PNG_BYTES
+            or not image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+            or hashlib.sha256(image_bytes).hexdigest() != digest
+        ):
+            raise ValueError("A validated native SOM map image changed before rendering")
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        image_data_uris[relative_name] = f"data:image/png;base64,{encoded}"
+
+    parser = _NativeAtlasRewriter(image_data_uris)
+    parser.feed(source)
+    parser.close()
+    document = "".join(parser.parts)
+    if parser.strict_links < 1 or parser.review_links < 1:
+        raise ValueError("Native SOM report is missing its derived behavior links")
+    if re.search(r"(?:src|href)\s*=\s*['\"](?:maps/|behavior/)", document, flags=re.IGNORECASE):
+        raise ValueError("Native SOM report still contains a local file reference")
+
+    first_pre = re.search(r"<pre\b[^>]*>.*?</pre\s*>", document, flags=re.IGNORECASE | re.DOTALL)
+    if first_pre:
+        details = f'<details class="som-data-provenance"><summary>Data and provenance</summary>{first_pre.group(0)}</details>'
+        document = document[:first_pre.start()] + details + document[first_pre.end():]
+
+    style = (
+        "<style>"
+        ".som-run-summary{margin:1rem auto;padding:1rem 1.25rem;max-width:72rem;border:1px solid #8b9bb4;"
+        "border-radius:.75rem;background:#f2f5fa;color:#18243a;font:500 1rem/1.5 system-ui,sans-serif}"
+        ".som-run-summary p{margin:.35rem 0 0}.som-data-provenance{margin:1rem auto;max-width:72rem}"
+        ".som-derived-summary{margin:2rem auto;max-width:72rem;padding:1rem;border-top:1px solid #9aa6b5}"
+        ".som-derived-summary pre{white-space:pre-wrap;overflow-wrap:anywhere}"
+        "</style>"
+    )
+    banner = _native_report_summary_banner(report)
+    has_html = re.search(r"<html\b", document, flags=re.IGNORECASE) is not None
+    has_head = re.search(r"<head\b", document, flags=re.IGNORECASE) is not None
+    has_body = re.search(r"<body\b", document, flags=re.IGNORECASE) is not None
+    if not has_html and not has_head and not has_body:
+        tag_finder = _FirstBodyContentTag(document)
+        tag_finder.feed(document)
+        tag_finder.close()
+        split_at = tag_finder.index if tag_finder.index is not None else 0
+        head_content, body_content = document[:split_at], document[split_at:]
+        charset = "" if re.search(r"<meta\b[^>]*\bcharset\s*=", head_content, flags=re.IGNORECASE) else '<meta charset="utf-8">'
+        document = (
+            f"<!doctype html><html><head>{charset}"
+            f"{head_content}{style}</head><body>{banner}{body_content}"
+        )
+    elif has_html and has_head and has_body:
+        document, head_count = re.subn(
+            r"<head\b[^>]*>",
+            lambda match: match.group(0) + style,
+            document,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        document, body_count = re.subn(
+            r"<body\b[^>]*>",
+            lambda match: match.group(0) + banner,
+            document,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if head_count != 1 or body_count != 1:
+            raise ValueError("Native SOM report document structure is ambiguous")
+    else:
+        raise ValueError("Native SOM report has an incomplete document wrapper")
+    sections = _native_report_behavior_sections(report)
+    body_end = re.search(r"</body\s*>", document, flags=re.IGNORECASE)
+    if not body_end:
+        document = document + sections + "</body></html>"
+    else:
+        document = document[:body_end.start()] + sections + document[body_end.start():]
+    if len(document.encode("utf-8")) > MAX_NATIVE_EMBEDDED_ATLAS_BYTES:
+        raise OverflowError("Native SOM atlas is too large to render safely")
+    return document
+
+
 @app.get("/api/agent/som/status")
 def agent_som_status():
     """Summarize configured SOM sources, validated artifacts, active model, and persisted jobs."""
@@ -807,6 +1129,11 @@ def agent_som_status():
         service_info = som_service.status()
         # Job records are returned in one place below to avoid duplicating them in the MCP payload.
         service_info.pop("external_jobs", None)
+        native_reports = {"native_reports": service_info.pop("native_reports", [])}
+        for report in native_reports.get("native_reports", []):
+            native_id = report.get("native_id")
+            if isinstance(native_id, str) and report.get("report_available") is True:
+                report["report_url"] = _native_report_url(native_id)
         return {
             "service": service_info,
             "active_model": {
@@ -817,6 +1144,7 @@ def agent_som_status():
             },
             "sources": som_service.list_sources(),
             "artifacts": som_service.list_artifacts(),
+            "native_reports": native_reports,
             "jobs": som_service.list_jobs(),
         }
     except SOMServiceError as exc:
@@ -828,6 +1156,108 @@ def agent_som_artifact(artifact_id: str):
     """Read whitelisted metadata for one validated artifact addressed by opaque ID."""
     try:
         return som_service.get_artifact(artifact_id)
+    except SOMServiceError as exc:
+        return _som_error_response(exc)
+
+
+@app.get("/api/agent/som/native-report")
+def agent_som_native_report(native_id: str):
+    """Read safe aggregate metadata for a native SOM report and return its local atlas URL."""
+    try:
+        report = som_service.get_native_report(native_id)
+        report = dict(report)
+        if report.get("report_available") is True:
+            report["report_url"] = _native_report_url(native_id)
+        return report
+    except SOMServiceError as exc:
+        return _som_error_response(exc)
+
+
+@app.get("/api/agent/som/native-reports/{native_id}/report")
+def agent_som_native_report_view(native_id: str):
+    """Serve a self-contained derived atlas with no cross-origin image or data requests."""
+    try:
+        report = som_service.get_native_report(native_id)
+        if report.get("status") != "completed" or report.get("report_available") is not True:
+            return JSONResponse({"error": "No matching validated native SOM report was found.", "code": "unknown_id"}, status_code=404)
+        report_path = som_service.get_native_report_file(native_id)
+        if report_path is None:
+            return JSONResponse({"error": "No matching validated native SOM report was found.", "code": "unknown_id"}, status_code=404)
+        document = _render_native_atlas(native_id, report, report_path)
+        return Response(
+            content=document,
+            media_type="text/html; charset=utf-8",
+            headers={
+                "Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; connect-src 'none'",
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+                "Content-Disposition": 'inline; filename="native-som-atlas.html"',
+            },
+        )
+    except SOMServiceError as exc:
+        return _som_error_response(exc)
+    except OverflowError:
+        return JSONResponse({"error": "The validated native SOM atlas exceeds the safe display limit.", "code": "too_large"}, status_code=413)
+    except (OSError, UnicodeDecodeError, TypeError, ValueError):
+        return JSONResponse({"error": "The validated native SOM atlas could not be rendered safely.", "code": "unavailable"}, status_code=409)
+
+
+def _native_behavior_json(native_id: str, kind: str):
+    """Expose only the validated aggregate fields referenced by the native HTML report."""
+    headers = {
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store",
+    }
+    try:
+        report = som_service.get_native_report(native_id)
+        payload = _native_report_behavior_payload(report, kind)
+        return JSONResponse(
+            payload,
+            headers=headers,
+        )
+    except SOMServiceError as exc:
+        response = _som_error_response(exc)
+        response.headers.update(headers)
+        return response
+    except (AttributeError, TypeError, ValueError):
+        return JSONResponse(
+            {"error": "No validated native SOM behavior summary was found.", "code": "unavailable"},
+            status_code=409,
+            headers=headers,
+        )
+
+
+@app.get("/api/agent/som/native-reports/{native_id}/behavior/strict-screen.json")
+def agent_som_native_strict_screen(native_id: str):
+    """Serve the validated lexical-screen aggregate, never its source records."""
+    return _native_behavior_json(native_id, "strict-screen")
+
+
+@app.get("/api/agent/som/native-reports/{native_id}/behavior/blinded-review.json")
+def agent_som_native_blinded_review(native_id: str):
+    """Serve review status and grade count only, never blinded review records."""
+    return _native_behavior_json(native_id, "blinded-review")
+
+
+@app.get("/api/agent/som/native-reports/{native_id}/maps/{map_name}/map.png")
+def agent_som_native_report_asset(native_id: str, map_name: str):
+    """Serve one whitelisted PNG from the native report's map index."""
+    try:
+        relative_name = f"maps/{map_name}/map.png"
+        asset_path = som_service.get_native_report_asset(native_id, relative_name)
+        if asset_path is None:
+            return JSONResponse(
+                {"error": "No matching native SOM map image was found.", "code": "unknown_id"},
+                status_code=404,
+            )
+        return FileResponse(
+            asset_path,
+            media_type="image/png",
+            filename="native-som-map.png",
+            content_disposition_type="inline",
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
     except SOMServiceError as exc:
         return _som_error_response(exc)
 

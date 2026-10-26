@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import threading
@@ -25,6 +26,18 @@ from research.som import make_artifact, save_artifact
 from research.som_pipeline import DEFAULT_HOOK, pressure_deltas, train_som
 
 CONDITIONS = ("neutral", "false_pressure", "true_claim", "valid_correction")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_local_manifest(tmp_path, monkeypatch):
+    manifest = tmp_path / "synthetic-som-sources.json"
+    manifest.write_text(json.dumps({
+        "schema_version": 1,
+        "source_roots": [],
+        "native_som_roots": [],
+        "external_jobs": [],
+    }), encoding="utf-8")
+    monkeypatch.setenv("EXPLORER_SOM_MANIFEST", str(manifest))
 
 
 def _write_prompts(path: Path, question_count: int = 3) -> list[dict[str, str]]:
@@ -51,6 +64,7 @@ def _service(tmp_path: Path, prompts: Path) -> SOMService:
     return SOMService(
         run_root=tmp_path / "runs",
         source_roots=[prompts.parent],
+        native_som_roots=[],
         default_model="org/fixture-model",
         default_revision="fixture-revision",
     )
@@ -174,8 +188,353 @@ def _fake_pipeline_command(service: SOMService, rows: list[dict[str, str]]):
     return run
 
 
+def _native_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _native_json(path: Path, payload: dict) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    return _native_digest(path)
+
+
+def _write_native_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    snapshot_root = tmp_path / "fixture-snapshot"
+    run_root = tmp_path / "fixture-native-run"
+    config = {
+        "schema": "som-teacher-forced-pairs-v1",
+        "model": "fixture-model-key",
+        "layers": [1],
+        "views": ["answer_mean"],
+        "readouts": ["pre_answer"],
+        "world_size": 1,
+    }
+    manifest = {"schema": "som-teacher-forced-inputs-v1", "fixture": True}
+    recipe = {
+        "schema": "attention-router-native-recipe-v1",
+        "model": {"model_id": "org/fixture-model", "revision": "fixture-revision"},
+        "tokenizer_revision": "fixture-tokenizer-revision",
+    }
+    tokens = {"schema": "som-teacher-token-preflight-v1", "fixture": True}
+    behavior_config = {"schema": "fixture-behavior-config-v1"}
+    behavior_plan = {"schema": "fixture-behavior-plan-v1"}
+    inputs = {
+        "configs/som_teacher_forced_v1.json": config,
+        "datasets/som-teacher-forced-v1/MANIFEST.json": manifest,
+        "datasets/som-teacher-forced-v1/recipe.json": recipe,
+        "preflight/native-tokens.json": tokens,
+        "configs/som_teacher_behavior_v1.json": behavior_config,
+        "datasets/som-teacher-behavior-v1/PLAN.json": behavior_plan,
+    }
+    extra_snapshot_file = snapshot_root / "src" / "fixture_module.py"
+    extra_snapshot_file.parent.mkdir(parents=True)
+    extra_snapshot_file.write_text("FIXTURE_SENTINEL = True\n", encoding="utf-8")
+    snapshot_hashes = {
+        name: _native_json(snapshot_root / name, payload)
+        for name, payload in inputs.items()
+    }
+    snapshot_hashes["src/fixture_module.py"] = _native_digest(extra_snapshot_file)
+    _native_json(snapshot_root / "SNAPSHOT.json", {
+        "schema": "attention-router-runtime-v1",
+        "experiment_schema": "som-teacher-forced-pairs-v1",
+        "exact_copied_bytes_authoritative": True,
+        "source_git_sha": "1" * 40,
+        "files": snapshot_hashes,
+    })
+    binding = {
+        "bundle_sha256": snapshot_hashes["datasets/som-teacher-forced-v1/MANIFEST.json"],
+        "snapshot_sha256": _native_digest(snapshot_root / "SNAPSHOT.json"),
+        "token_audit_sha256": snapshot_hashes["preflight/native-tokens.json"],
+    }
+
+    map_name = "fixture-map"
+    map_dir = run_root / "maps" / map_name
+    map_dir.mkdir(parents=True)
+    map_npz = map_dir / "map.npz"
+    np.savez_compressed(
+        map_npz,
+        prototypes=np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+        cells=np.asarray([0, 0], dtype=np.int64),
+        fit=np.asarray([True, False], dtype=np.bool_),
+        errors=np.asarray([0.1, 0.2], dtype=np.float32),
+    )
+    png = map_dir / "map.png"
+    png.write_bytes(
+        base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/aWQAAAAASUVORK5CYII="
+        )
+    )
+    (map_dir / "worker.lock").write_bytes(b"")
+    map_summary = {
+        "binding": binding,
+        "task": {"kind": "som", "name": map_name, "view": "answer_mean", "layer": 1, "side": 1, "seed": 7},
+        "causal_steering_tested": False,
+        "direction_sign": "good minus bad",
+        "states": 2,
+        "fit_states": 1,
+        "candidate_direction_geometry": {
+            "vectors": 1,
+            "energy_fractions": [1.0],
+            "rank90": 1,
+            "participation_rank": 1.0,
+        },
+        "condition_geometry": {
+            "vectors": 1,
+            "energy_fractions": [1.0],
+            "rank90": 1,
+            "participation_rank": 1.0,
+        },
+        "associations": {
+            "fixture_source/MAP_FIT": {
+                "states": 1,
+                "occupied_cells": 1,
+                "quantization_error": 0.1,
+                "condition_nmi": 0.5,
+            },
+        },
+        "fit_history": [1.0, 0.5],
+    }
+    summary_hash = _native_json(map_dir / "summary.json", map_summary)
+    map_files = {
+        "map.npz": _native_digest(map_npz),
+        "map.png": _native_digest(png),
+        "summary.json": summary_hash,
+        "worker.lock": _native_digest(map_dir / "worker.lock"),
+    }
+    _native_json(map_dir / "complete.json", {"binding": binding, "task": map_summary["task"], "files": map_files})
+
+    (run_root / "maps").mkdir(parents=True, exist_ok=True)
+    report_path = run_root / "report.html"
+    report_path.write_text(
+        f'<html><body><img src="maps/{map_name}/map.png"></body></html>',
+        encoding="utf-8",
+    )
+    stability_hash = _native_json(run_root / "stability.json", [
+        {"left": "fixture-a", "right": "fixture-b", "project_adjusted_rand": 0.5},
+    ])
+    geometry = {
+        "binding": binding,
+        "pairs": 1,
+        "answer_sequences": 2,
+        "maps": 1,
+        "capture_workers": 1,
+        "conditions": {"fixture_condition": 1},
+        "mock": False,
+        "teacher_forced": True,
+        "base_weights_updated": False,
+        "scientific_success_claim": False,
+        "report_sha256": _native_digest(report_path),
+        "stability_sha256": stability_hash,
+    }
+    geometry_hash = _native_json(run_root / "geometry-complete.json", geometry)
+
+    banks_dir = run_root / "behavior" / "banks"
+    bank_reports = {}
+    bank_files = {}
+    for name, count in (("global", 1), ("kmeans", 1), ("som", 1)):
+        bank_path = banks_dir / f"{name}.npz"
+        banks_dir.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            bank_path,
+            center=np.zeros(4, dtype=np.float32),
+            scale=np.ones(4, dtype=np.float32),
+            pca_mean=np.zeros(4, dtype=np.float32),
+            pca_components=np.ones((1, 4), dtype=np.float32),
+            coef=np.ones((count, 1), dtype=np.float32),
+            bias=np.zeros(count, dtype=np.float32),
+            vectors=np.ones((count, 4), dtype=np.float32),
+            activation_rms=np.asarray(1.0, dtype=np.float32),
+        )
+        bank_files[f"{name}.npz"] = _native_digest(bank_path)
+        report = {
+            "method": name,
+            "direction": "good minus bad at shared suffix",
+            "routing_input": "independent prompt-only pass before either answer",
+            "training_families": 1,
+            "training_pairs": 1,
+            "global_direction_norm": 1.0,
+            "mean_individual_delta_norm": 1.0,
+        }
+        if name != "global":
+            report.update({
+                "cells_with_local_estimates": 1,
+                "fit_route_accuracy": 0.5,
+                "fit_majority_route_accuracy": 0.5,
+                "project_route_accuracy": 0.5,
+                "project_majority_route_accuracy": 0.5,
+                "project_by_condition": {
+                    "fixture_condition": {"n": 1, "route_matches": 0, "predicted_occupancy": [1]},
+                },
+            })
+        bank_reports[name] = report
+    bank_hash = _native_json(banks_dir / "complete.json", {
+        "binding": binding,
+        "config_sha256": snapshot_hashes["configs/som_teacher_behavior_v1.json"],
+        "plan_sha256": snapshot_hashes["datasets/som-teacher-behavior-v1/PLAN.json"],
+        "files": bank_files,
+        "bank_reports": bank_reports,
+    })
+
+    behavior_dir = run_root / "behavior"
+    behavior_files = {
+        "blinded-review.json": {"fixture": True},
+        "paired-screens.json": {
+            "condition_case_counts": {"fixture_condition": 1},
+            "records": [{"case_id": "fixture-case", "semantic_grade": None}],
+        },
+        "strict-screen.json": {
+            "scope": "conservative lexical screen only",
+            "cells": {
+                "EVALUATE/fixture_condition/base": {
+                    "n": 1,
+                    "strict_matches": 0,
+                    "needs_semantic_review": 1,
+                    "capped": 0,
+                },
+            },
+        },
+        "unblind.json": {"fixture": True},
+    }
+    behavior_file_hashes = {
+        name: _native_json(behavior_dir / name, payload)
+        for name, payload in behavior_files.items()
+    }
+    behavior = {
+        "binding": {
+            **binding,
+            "banks_sha256": bank_hash,
+            "behavior_plan_sha256": snapshot_hashes["datasets/som-teacher-behavior-v1/PLAN.json"],
+        },
+        "cases": 1,
+        "arms": 1,
+        "answers": 1,
+        "mock": False,
+        "semantic_review": "pending",
+        "mitigation_established": False,
+        "hypothesis_confirmed": False,
+        "all_strengths_prespecified": True,
+        "files": behavior_file_hashes,
+    }
+    behavior_hash = _native_json(behavior_dir / "complete.json", behavior)
+    complete = {
+        "binding": binding,
+        "teacher_forced": True,
+        "maps": 1,
+        "free_generation_answers": 1,
+        "scientific_success_claim": False,
+        "mock": False,
+        "geometry_sha256": geometry_hash,
+        "behavior_sha256": behavior_hash,
+    }
+    complete_hash = _native_json(run_root / "complete.json", complete)
+
+    capture_root = run_root / "capture" / "rank0"
+    capture_root.mkdir(parents=True)
+    chunk_path = capture_root / "chunk-000000.npz"
+    np.savez_compressed(chunk_path, fixture=np.asarray([1], dtype=np.int32))
+    identity_hash = _native_json(capture_root / "identity.json", {
+        **binding,
+        "rank": 0,
+        "world_size": 1,
+        "teacher_forced": True,
+        "zero_logit_equivalence": True,
+        "layers": [1],
+        "readouts": ["pre_answer"],
+        "capture_policy": "fixture prompt-only state",
+        "provenance": {
+            "model_id": "org/fixture-model",
+            "revision": "fixture-revision",
+            "tokenizer_revision": "fixture-tokenizer-revision",
+            "checkpoint_sha256": {"fixture.safetensors": "a" * 64},
+            "implementation_sha256": {"fixture_capture.py": "b" * 64},
+            "metadata_sha256": {"config.json": "c" * 64},
+            "loading_info": {
+                "error_msgs": [],
+                "mismatched_keys": [],
+                "missing_keys": [],
+                "unexpected_keys": [],
+            },
+            "layout": [{"layer": 1, "projection_module": "model.layers.1.self_attn.o_proj"}],
+        },
+    })
+    qualification_hash = _native_json(capture_root / "native-qualification.json", {
+        "binding": binding,
+        "causality_tolerance": 0.01,
+        "read_only_logits_exact": True,
+        "records": [{"fixture": True}],
+        "router_state": "fixture prompt only; no supplied continuation",
+    })
+    _native_json(capture_root / "complete.json", {
+        "binding": binding,
+        "rank": 0,
+        "weights_unchanged": True,
+        "pairs": 1,
+        "files": {
+            "chunk-000000.npz": _native_digest(chunk_path),
+            "identity.json": identity_hash,
+            "native-qualification.json": qualification_hash,
+        },
+    })
+
+    behavior_rank_dir = run_root / "behavior" / "rank0"
+    behavior_rank_dir.mkdir(parents=True, exist_ok=True)
+    answers_path = behavior_rank_dir / "answers.jsonl"
+    answers_path.write_text('{"fixture":true}\n', encoding="utf-8")
+    qualification_path = behavior_rank_dir / "qualification.json"
+    qualification_path.write_text('{"fixture":true}\n', encoding="utf-8")
+    behavior_rank_hash = _native_json(behavior_rank_dir / "complete.json", {
+        "binding": binding,
+        "rank": 0,
+        "weights_unchanged": True,
+        "answers": 1,
+        "files": {
+            "answers.jsonl": _native_digest(answers_path),
+            "qualification.json": _native_digest(qualification_path),
+        },
+    })
+    capture_receipt_path = capture_root / "complete.json"
+    map_receipt_path = map_dir / "complete.json"
+
+    stage_specials = {
+        "capture": {},
+        "analyze": {
+            "../../behavior/banks/complete.json": bank_hash,
+            "../../geometry-complete.json": geometry_hash,
+        },
+        "generate": {
+            "../../behavior/complete.json": behavior_hash,
+            "../../complete.json": complete_hash,
+            "../../report.html": _native_digest(report_path),
+        },
+    }
+    for stage, specials in stage_specials.items():
+        payloads = {
+            "capture": {"capture/rank0/complete.json": _native_digest(capture_receipt_path)},
+            "analyze": {f"maps/{map_name}/complete.json": _native_digest(map_receipt_path)},
+            "generate": {"behavior/rank0/complete.json": behavior_rank_hash},
+        }[stage]
+        rank_record = {
+            "binding": binding,
+            "phase": stage,
+            "rank": 0,
+            "world_size": 1,
+            "mock": False,
+            "payloads": payloads,
+        }
+        rank_hash = _native_json(run_root / "stages" / stage / "rank0.json", rank_record)
+        stage_files = {"rank0.json": rank_hash, **specials}
+        _native_json(run_root / "stages" / stage / "complete.json", {
+            "binding": binding,
+            "phase": stage,
+            "world_size": 1,
+            "mock": False,
+            "files": stage_files,
+        })
+    return run_root, snapshot_root
+
+
 def test_bundled_source_is_labeled_and_artifact_roots_are_not_exposed(tmp_path):
-    service = SOMService(run_root=tmp_path / "runs")
+    service = SOMService(run_root=tmp_path / "runs", native_som_roots=[])
     bundled = [source for source in service.list_sources()["sources"] if source["dataset_kind"] == "bundled_example"]
     assert len(bundled) == 1
     assert bundled[0]["label"] == "Bundled example prompts"
@@ -208,7 +567,7 @@ def test_external_job_summary_is_historical_and_manifest_paths_are_not_returned(
         }],
     }), encoding="utf-8")
     monkeypatch.setenv("EXPLORER_SOM_MANIFEST", str(manifest))
-    service = SOMService(run_root=tmp_path / "runs")
+    service = SOMService(run_root=tmp_path / "runs", native_som_roots=[])
 
     job = service.get_job("123456_0")
     assert job["status"] == "unverified"
@@ -221,8 +580,9 @@ def test_external_job_summary_is_historical_and_manifest_paths_are_not_returned(
     service.close()
 
 
-def test_default_local_manifest_persists_source_roots_but_explicit_empty_roots_win(tmp_path):
+def test_default_local_manifest_persists_source_roots_but_explicit_empty_roots_win(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
+    monkeypatch.delenv("EXPLORER_SOM_MANIFEST", raising=False)
     local_sources = tmp_path / "authorized-local-inputs"
     source_file = local_sources / "paired.jsonl"
     _write_prompts(source_file)
@@ -234,7 +594,7 @@ def test_default_local_manifest_persists_source_roots_but_explicit_empty_roots_w
         "external_jobs": [],
     }), encoding="utf-8")
 
-    configured = SOMService(repo_root=repo_root, run_root=tmp_path / "configured-runs")
+    configured = SOMService(repo_root=repo_root, run_root=tmp_path / "configured-runs", native_som_roots=[])
     assert any(source["dataset_kind"] == "configured_local_input" for source in configured.list_sources()["sources"])
     configured.close()
 
@@ -242,17 +602,19 @@ def test_default_local_manifest_persists_source_roots_but_explicit_empty_roots_w
         repo_root=repo_root,
         run_root=tmp_path / "empty-runs",
         source_roots=[],
+        native_som_roots=[],
     )
     assert not any(source["dataset_kind"] == "configured_local_input" for source in explicit_empty.list_sources()["sources"])
     explicit_empty.close()
 
 
-def test_invalid_local_manifest_is_reported_without_exposing_its_path(tmp_path):
+def test_invalid_local_manifest_is_reported_without_exposing_its_path(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
+    monkeypatch.delenv("EXPLORER_SOM_MANIFEST", raising=False)
     manifest_dir = repo_root / "explorer"
     manifest_dir.mkdir(parents=True)
     (manifest_dir / "som_sources.local.json").write_text("not-json", encoding="utf-8")
-    service = SOMService(repo_root=repo_root, run_root=tmp_path / "runs")
+    service = SOMService(repo_root=repo_root, run_root=tmp_path / "runs", native_som_roots=[])
 
     status = service.status()
     assert status["status"] == "degraded"
@@ -281,6 +643,7 @@ def test_existing_artifact_requires_active_model_revision_and_hook_match(tmp_pat
     service = SOMService(
         run_root=tmp_path / "runs",
         source_roots=[source_root],
+        native_som_roots=[],
         default_model="org/current-model",
         default_revision="revision-b",
     )
@@ -469,9 +832,140 @@ def test_service_startup_marks_orphaned_jobs_interrupted(tmp_path):
         "updated_at": "2026-10-26T00:01:00Z",
     }), encoding="utf-8")
 
-    service = SOMService(run_root=tmp_path / "runs")
+    service = SOMService(run_root=tmp_path / "runs", native_som_roots=[])
     job = service.get_job(job_id)
     assert job["status"] == "interrupted"
     assert job["error_code"] == "interrupted"
     assert "restarted" in job["error"]
     service.close()
+
+
+def test_native_som_report_exposes_receipt_bound_summaries_and_safe_report_assets(tmp_path):
+    output_root, snapshot_root = _write_native_fixture(tmp_path)
+    service = SOMService(
+        run_root=tmp_path / "local-runs",
+        source_roots=[],
+        native_som_roots=[{"output_root": str(output_root), "snapshot_root": str(snapshot_root)}],
+        default_model="org/fixture-model",
+        default_revision="fixture-revision",
+    )
+
+    catalog = service.list_native_reports()["native_reports"]
+    assert len(catalog) == 1
+    assert catalog[0]["status"] == "completed"
+    assert catalog[0]["integrity_status"] == "verified"
+    assert catalog[0]["capture_provenance_status"] == "verified"
+    assert catalog[0]["map_count"] == 1
+    assert catalog[0]["report_available"] is True
+    assert "output_root" not in json.dumps(catalog)
+    report = service.get_native_report(catalog[0]["native_id"])
+    assert report["provenance"]["model_id"] == "org/fixture-model"
+    assert report["hook_template"] == "model.layers.{layer}.self_attn.o_proj"
+    assert report["feature_space"] == "attention_projection_output"
+    assert report["model_revision_hook_match"] is False
+    assert report["reuse_compatibility"] == "not_assessed"
+    assert report["maps"][0]["map_name"] == "fixture-map"
+    assert report["maps"][0]["map_shape"] == [1, 1, 4]
+    assert report["behavior"]["semantic_grade_count"] == 0
+    assert report["behavior"]["banks"][0]["vector_count"] == 1
+    serialized = json.dumps(report)
+    assert "prototypes" not in serialized
+    assert "scored_records" not in serialized
+    assert str(output_root) not in serialized
+    assert service.get_native_report_file(catalog[0]["native_id"]) == output_root / "report.html"
+    assert service.get_native_report_asset(catalog[0]["native_id"], "maps/fixture-map/map.png") == output_root / "maps/fixture-map/map.png"
+    assert service.get_native_report_asset(catalog[0]["native_id"], "maps/../report.html") is None
+    assert service.status()["native_reports"][0]["native_id"] == catalog[0]["native_id"]
+    service.close()
+
+
+def test_native_som_tamper_is_invalid_and_missing_capture_is_only_partial(tmp_path):
+    output_root, snapshot_root = _write_native_fixture(tmp_path)
+    chunk = output_root / "capture" / "rank0" / "chunk-000000.npz"
+    chunk.unlink()
+    service = SOMService(
+        run_root=tmp_path / "local-runs",
+        source_roots=[],
+        native_som_roots=[{"output_root": str(output_root), "snapshot_root": str(snapshot_root)}],
+    )
+    native_id = service.list_native_reports()["native_reports"][0]["native_id"]
+    partial = service.get_native_report(native_id)
+    assert partial["status"] == "completed"
+    assert partial["integrity_status"] == "outputs_verified"
+    assert partial["capture_provenance_status"] == "pending"
+    assert partial["report_available"] is True
+    service.close()
+
+    (output_root / "maps" / "fixture-map" / "map.png").write_bytes(b"modified")
+    invalid_service = SOMService(
+        run_root=tmp_path / "invalid-local-runs",
+        source_roots=[],
+        native_som_roots=[{"output_root": str(output_root), "snapshot_root": str(snapshot_root)}],
+    )
+    invalid = invalid_service.list_native_reports()["native_reports"][0]
+    assert invalid["status"] == "invalid"
+    assert invalid["integrity_status"] == "invalid"
+    assert invalid.get("report_url") is None
+    invalid_service.close()
+
+
+def test_native_snapshot_hashes_every_indexed_file(tmp_path):
+    output_root, snapshot_root = _write_native_fixture(tmp_path)
+    (snapshot_root / "src" / "fixture_module.py").write_text("FIXTURE_SENTINEL = False\n", encoding="utf-8")
+    service = SOMService(
+        run_root=tmp_path / "local-runs",
+        source_roots=[],
+        native_som_roots=[{"output_root": str(output_root), "snapshot_root": str(snapshot_root)}],
+    )
+
+    report = service.list_native_reports()["native_reports"][0]
+    assert report["status"] == "invalid"
+    assert report["integrity_status"] == "invalid"
+    service.close()
+
+
+def test_native_stage_payload_digest_must_match_the_referenced_map_receipt(tmp_path):
+    output_root, snapshot_root = _write_native_fixture(tmp_path)
+    analyze_rank_path = output_root / "stages" / "analyze" / "rank0.json"
+    analyze_rank = json.loads(analyze_rank_path.read_text(encoding="utf-8"))
+    analyze_rank["payloads"]["maps/fixture-map/complete.json"] = "0" * 64
+    analyze_rank_digest = _native_json(analyze_rank_path, analyze_rank)
+    stage_complete_path = output_root / "stages" / "analyze" / "complete.json"
+    stage_complete = json.loads(stage_complete_path.read_text(encoding="utf-8"))
+    stage_complete["files"]["rank0.json"] = analyze_rank_digest
+    _native_json(stage_complete_path, stage_complete)
+    service = SOMService(
+        run_root=tmp_path / "local-runs",
+        source_roots=[],
+        native_som_roots=[{"output_root": str(output_root), "snapshot_root": str(snapshot_root)}],
+    )
+
+    report = service.list_native_reports()["native_reports"][0]
+    assert report["status"] == "invalid"
+    assert report["integrity_status"] == "invalid"
+    service.close()
+
+
+def test_native_html_allows_only_local_report_assets_and_safe_image_data(tmp_path):
+    png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/aWQAAAAASUVORK5CYII="
+    safe_path = tmp_path / "safe.html"
+    safe_path.write_text(
+        '<style>body { color: #222; }</style>'
+        '<img src="maps/fixture-map/map.png">'
+        '<a href="behavior/strict-screen.json">summary</a>'
+        f'<img src="data:image/png;base64,{png_data}">',
+        encoding="utf-8",
+    )
+    assert SOMService._native_html_is_safe(safe_path, {"fixture-map"}) is True
+
+    unsafe_html = (
+        '<style>@import url("https://example.test/style.css");</style>',
+        '<style>body { background: url(https://example.test/image.png); }</style>',
+        '<a href="data:image/png;base64,' + png_data + '">remote data anchor</a>',
+        '<a href="https://example.test/">external link</a>',
+        '<img src="https://example.test/image.png">',
+    )
+    for index, contents in enumerate(unsafe_html):
+        path = tmp_path / f"unsafe-{index}.html"
+        path.write_text(contents, encoding="utf-8")
+        assert SOMService._native_html_is_safe(path, {"fixture-map"}) is False

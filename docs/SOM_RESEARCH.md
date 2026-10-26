@@ -76,3 +76,21 @@ External scheduler records include the date of the recorded state. A historical 
 completed record does not verify the current queue or establish that a SOM was fitted.
 Artifacts from a different pipeline require their exact hook, model, tokenizer, and experimental
 meaning to match. A matching hidden dimension alone is insufficient.
+
+## Inspecting a native SOM run
+
+`som_status` also lists configured native report IDs. `som_read_native_report` reads
+receipt-validated native maps, aggregate geometry, vector-bank metadata, and behavioral
+summary counts. Its default map list is compact; select one exact `map_name` for detailed
+map diagnostics. Directions remain read-only and are not applied to the local pilot hook.
+
+To connect a run, add `native_som_roots` to the ignored local manifest. Each entry names
+`output_root` and `snapshot_root`, both local directories. The reader checks the frozen
+snapshot, dataset and token-audit bindings, stage receipts, and output hashes before
+reporting verified integrity. It does not infer semantic grading or scientific success
+from completed job receipts.
+
+The local report viewer renders validated map images and aggregate summaries. It keeps
+the original artifacts unchanged, disables scripts, and exposes no arbitrary file paths.
+Private raw examples in a configured native report remain local report content; MCP
+responses contain whitelisted aggregate metadata rather than per-example answers.

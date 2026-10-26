@@ -20,6 +20,9 @@ Checkpoint: `meta-llama/Llama-3.2-3B-Instruct`, revision
   evaluation through `som_run_pilot`. The ChatGPT panel called `som_status`,
   `som_job_status`, and `som_read_artifact` and distinguished local pilot artifacts from
   historical external job records.
+- Native artifact integration: verified snapshot and cross-stage receipts, map/capture/bank
+  integrity, aggregate-only MCP inspection, and sandboxed atlas rendering with embedded PNGs.
+  The browser loaded all configured map images; source artifacts remained unchanged.
 - Automated tests cover model routing, MPS placement, normalization, hooks, cache isolation,
   non-square neuron grids, data validation, leakage checks, SOM fitting, and projection math.
 
