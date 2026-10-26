@@ -1,5 +1,6 @@
-import { createMap } from "./map3d.js?v=70";
+import { createMap } from "./map3d.js?v=71";
 import { createScatter } from "./scatter.js?v=39";
+import { createResidualMap } from "./residual-map.js?v=1";
 
 const $ = s => document.querySelector(s);
 const api = async (p, body) => {
@@ -13,6 +14,7 @@ const fmtDose = d => (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d);
 
 let agentSelecting = false, agentMarked = false;  // ChatGPT's selections and marks (see agentUi); declared early, openNeuron reads them on load
 const state = { layer: null, units: {}, unitMap: {}, focus: null, view: "map", chat: { mode: "add", dir: "writes", dose: { add: 0.8, mul: 2 } } };
+let mapResidualMode = false, residualMap = null, mapUiReady = false;
 const ADD_STEPS = [...Array.from({ length: 30 }, (_, i) => +((i + 1) * 0.05).toFixed(2)), 1.75, 2, 2.5, 3, 4, 5];
 const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12, 16];
 
@@ -32,12 +34,13 @@ function emptyMap() {
     debug: () => ({}),
     setUnits() {}, select() {}, setConnections() {}, setHoverConnections() {}, setLayout() {}, setWeb() {},
     setMarks() {}, setInsets() {}, hover() {}, enterLayer() {}, exitLayer() {}, viewLayer() {}, setNotes() {},
-    focusNeuron() {}, flyToNeuron() {}, home() {},
+    focusNeuron() {}, flyToNeuron() {}, home() {}, setResidualLayers() {}, setResidualMode() {},
   };
 }
 
 // ---------- map ----------
 const map = arch ? createMap($("#map"), $("#layer-labels"), arch, {
+  onResidualLayer: layer => residualMap?.setLayer(layer),
   onPick: (layer, n) => openNeuron(layer, n, "neuron", true, false),
   onLayerMode: l => {
     $("#layer-back").classList.toggle("on", l !== null);
@@ -46,6 +49,7 @@ const map = arch ? createMap($("#map"), $("#layer-labels"), arch, {
   },
   onHover: (p, x, y) => {
     if (!p) return hideTip();
+    if (p.type === "residualLayer") return showTip(x, y, `L${p.layer} · matched residual states`, `${p.n_pairs} pairs · mean delta RMS ${p.mean_delta_rms.toFixed(3)} · original residual space`);
     if (p.type === "block") {
       if (hoverKey) { hoverKey = null; map.setHoverConnections(null); }
       const full = p.full;
@@ -73,6 +77,7 @@ const map = arch ? createMap($("#map"), $("#layer-labels"), arch, {
     hoverKey = key;
   },
 }) : emptyMap();
+residualMap = createResidualMap({ host: $("#residual-map"), map, onLayer: layer => setLayer(layer) });
 function showTip(x, y, head, body) { showTipHTML(x, y, head, esc(body)); }
 function showTipHTML(x, y, head, html) {
   tip.innerHTML = `<div class="lab">${esc(head)}</div>${html}`;
@@ -170,7 +175,28 @@ function setView(v) {
   $("#residuals-view").classList.toggle("on", v === "residuals");
   if (v === "embed") loadEmbeddings();
   if (v === "residuals") loadResidualWorkspace();
+  $("#map-kind").hidden = v !== "map";
+  syncMapRepresentation();
 }
+function syncMapRepresentation() {
+  const enabled = state.view === "map" && mapResidualMode;
+  if (enabled && location.hash !== "#states") history.replaceState(null, "", `${location.pathname}${location.search}#states`);
+  if (!enabled && location.hash === "#states") history.replaceState(null, "", `${location.pathname}${location.search}`);
+  document.body.classList.toggle("residual-map-open", enabled);
+  $("#residual-map").hidden = !enabled;
+  map.setResidualMode(enabled);
+  residualMap?.setEnabled(enabled);
+  document.querySelectorAll("#map-kind button").forEach(button => {
+    const selected = (button.dataset.mapKind === "residuals") === mapResidualMode;
+    button.classList.toggle("on", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  });
+  if (mapUiReady) updateInsets();
+}
+document.querySelectorAll("#map-kind button").forEach(button => button.onclick = () => {
+  mapResidualMode = button.dataset.mapKind === "residuals";
+  syncMapRepresentation();
+});
 if (location.hash === "#residuals") setView("residuals");
 function loadResidualWorkspace() {
   if (residualWorkspacePromise) return residualWorkspacePromise;
@@ -204,7 +230,10 @@ layerSel.disabled = !arch;
 $("#inf-hi").value = arch ? arch.n_layers - 1 : 0;
 for (const selector of ["#jump", "#web-z", "#lens-q", "#inf-text"]) $(selector).disabled = !arch;
 document.querySelectorAll("#q-mode button, #web-mode button, #layout-mode button").forEach(button => { button.disabled = !arch; });
-layerSel.onchange = () => { setLayer(+layerSel.value); map.enterLayer(+layerSel.value); };
+layerSel.onchange = () => {
+  if (mapResidualMode && state.view === "map") residualMap.setLayer(+layerSel.value);
+  else { setLayer(+layerSel.value); map.enterLayer(+layerSel.value); }
+};
 
 async function setLayer(l) {
   if (!arch) return;
@@ -452,12 +481,19 @@ $("#jump").addEventListener("keydown", e => {
 });
 addEventListener("hashchange", fromHash);
 function fromHash() {
+  if (location.hash === "#states") { mapResidualMode = true; setView("map"); return; }
+  if (location.hash === "#residuals") { setView("residuals"); return; }
   const m = location.hash.match(/^#L(\d+)\/N(\d+)/);
   if (m && !(state.focus && state.focus.layer === +m[1] && state.focus.n === +m[2])) openNeuron(+m[1], +m[2], "neuron", false);
 }
 
 // ---------- panel collapse ----------
 function updateInsets() {
+  if (state.view === "map" && mapResidualMode) {
+    map.setInsets(0, innerWidth > 760 ? 400 : 0);
+    return;
+  }
+  if (state.view === "residuals") { map.setInsets(0, 0); return; }
   const listShown = !$("#list").classList.contains("hidden");
   const focusShown = focusEl.classList.contains("on") && !focusEl.classList.contains("collapsed");
   map.setInsets(listShown ? $("#list").getBoundingClientRect().width + 24 : 0, focusShown ? focusEl.getBoundingClientRect().width + 24 : 0);
@@ -1138,5 +1174,6 @@ $("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.ctl
 $("#a-new").onclick = () => { resetAgent(); clearAgentMarks(); };
 loadAgent(); renderAgentActions();
 renderList();
+mapUiReady = true;
 syncEdge(); updateInsets();
 addEventListener("pagehide", saveAgent);

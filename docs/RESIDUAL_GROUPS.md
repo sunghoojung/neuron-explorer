@@ -44,6 +44,22 @@ For a selected layer and point, the summary reports:
 
 All measurements are descriptive geometry. They do not establish that a response is truthful, that groups are behaviorally different in a reliable population, or that a particular condition caused a change.
 
+## Residuals on the model map
+
+The original **map** view has a **neurons / states** switch. State mode adds strips
+only at captured layers; their height and color encode mean paired RMS difference.
+Choose a measured layer to inspect a two-dimensional PCA cloud or a compatible
+saved SOM. Dots represent training rows, triangles represent held-out rows, and
+lines connect matched group cases. A selected case stays selected across layers.
+Case details report raw residual norms and paired L2 distances separately from
+the projected coordinates. Each layer has its own training-fitted PCA axes, so
+positions across layer plots are not a shared coordinate trajectory.
+
+The map and single-case read endpoints are `/captures/{capture_id}/map` and
+`/captures/{capture_id}/sample` under `/api/residuals`. They read verified saved
+captures without running the model. SOM cell indices describe that particular
+fit and are not comparable across separate fits or layers.
+
 ## SOM fitting
 
 `states` mode trains the SOM on final-token states from training samples only. `paired_delta` mode trains on one training vector per complete pair, computed as `group_a - group_b`. Pair and family split rules prevent those examples from crossing between training and held-out splits.

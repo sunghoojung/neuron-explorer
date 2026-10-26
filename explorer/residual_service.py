@@ -45,6 +45,11 @@ except ImportError:  # server.py places explorer/ on sys.path
         score_residual_continuation,
     )
 
+try:
+    from .residual_projection import pca_project_2d
+except ImportError:  # server.py places explorer/ on sys.path
+    from residual_projection import pca_project_2d
+
 
 POINTS = ("resid_pre", "resid_mid", "resid_post", "attn_write", "mlp_write")
 SPLITS = ("train", "validation", "test")
@@ -1164,6 +1169,139 @@ class ResidualService:
         return {"capture_id": capture_id, "integrity_status": capture["job"].get("integrity_status", "verified"), "selected": {"layer": layer, "point": point}, "groups": groups, "pairs": pairs, "samples": strips,
                 "token_alignment_note": "Relative positions are local to each prompt; token IDs and token text are not aligned across samples.",
                 "provenance": provenance}
+
+    def get_capture_map(
+        self,
+        capture_id: str,
+        *,
+        layer: int,
+        point: str,
+        group_a: str,
+        group_b: str,
+        split: str = "all",
+    ) -> dict[str, Any]:
+        """Return train-fitted PCA coordinates and raw matched-pair geometry."""
+        capture = self._load_capture(capture_id)
+        layers = capture["metadata"]["layers"]
+        points = capture["metadata"]["points"]
+        samples = capture["dataset"]["samples"]
+        groups = {sample["group"] for sample in samples}
+        if isinstance(layer, bool) or not isinstance(layer, int) or layer not in layers:
+            raise ResidualServiceError("invalid_input", "layer must be one of the captured layers")
+        if not isinstance(point, str) or point not in points:
+            raise ResidualServiceError("invalid_input", "point must be one of the captured residual points")
+        if not isinstance(group_a, str) or not isinstance(group_b, str) or group_a == group_b or group_a not in groups or group_b not in groups:
+            raise ResidualServiceError("invalid_input", "group_a and group_b must name two distinct captured groups")
+        if not isinstance(split, str) or split not in {"all", *SPLITS}:
+            raise ResidualServiceError("invalid_input", "split must be all, train, validation, or test")
+
+        chosen = [sample for sample in samples if sample["group"] in {group_a, group_b}]
+        training = [sample for sample in chosen if sample["split"] == "train"]
+        train_groups = {sample["group"] for sample in training}
+        if len(training) < 2 or train_groups != {group_a, group_b}:
+            raise ResidualServiceError("insufficient_training", "Map projection needs at least two training rows and one from each selected group", 422)
+
+        all_vectors = {
+            sample["id"]: self._select_vector(capture, index, layer, point)
+            for index, sample in enumerate(samples)
+            if sample["group"] in {group_a, group_b}
+        }
+        training_vectors = np.stack([all_vectors[sample["id"]] for sample in training])
+        display_samples = [sample for sample in chosen if split == "all" or sample["split"] == split]
+        display_vectors = np.stack([all_vectors[sample["id"]] for sample in display_samples]) if display_samples else np.empty((0, training_vectors.shape[1]), dtype=np.float32)
+        projection = pca_project_2d(training_vectors, display_vectors)
+        coordinates = {sample["id"]: projection["coordinates"][index] for index, sample in enumerate(display_samples)}
+        projection_points = [
+            {
+                "id": sample["id"], "pair_id": sample["pair_id"], "family_id": sample["family_id"],
+                "group": sample["group"], "split": sample["split"],
+                "x": float(coordinates[sample["id"]][0]), "y": float(coordinates[sample["id"]][1]),
+                "norm": float(np.linalg.norm(all_vectors[sample["id"]].astype(np.float64))),
+            }
+            for sample in display_samples
+        ]
+        centroids = []
+        for group in (group_a, group_b):
+            rows = [coordinates[sample["id"]] for sample in display_samples if sample["group"] == group]
+            if rows:
+                mean = np.stack(rows).mean(axis=0)
+                centroids.append({"group": group, "x": float(mean[0]), "y": float(mean[1]), "n": len(rows)})
+            else:
+                centroids.append({"group": group, "x": None, "y": None, "n": 0})
+
+        pair_rows = self._paired_rows(samples, group_a, group_b, split=None if split == "all" else split)
+        pair_records = [
+            {
+                "pair_id": row_a["pair_id"], "a_id": row_a["id"], "b_id": row_b["id"],
+                "distance_l2": float(np.linalg.norm(all_vectors[row_a["id"]].astype(np.float64) - all_vectors[row_b["id"]].astype(np.float64))),
+            }
+            for row_a, row_b in pair_rows
+        ]
+
+        layer_metrics = []
+        display_pairs = [(a, b) for a, b in self._paired_rows(samples, group_a, group_b, split=None if split == "all" else split)]
+        sample_by_id = {sample["id"]: index for index, sample in enumerate(samples)}
+        for layer_value in layers:
+            pairs_for_layer = []
+            for row_a, row_b in display_pairs:
+                vector_a = self._select_vector(capture, sample_by_id[row_a["id"]], layer_value, point).astype(np.float64)
+                vector_b = self._select_vector(capture, sample_by_id[row_b["id"]], layer_value, point).astype(np.float64)
+                pairs_for_layer.append((vector_a, vector_b))
+            if pairs_for_layer:
+                values_a = np.stack([pair[0] for pair in pairs_for_layer])
+                values_b = np.stack([pair[1] for pair in pairs_for_layer])
+                deltas = values_a - values_b
+                centroid_a, centroid_b = values_a.mean(axis=0), values_b.mean(axis=0)
+                norm_a, norm_b = np.linalg.norm(centroid_a), np.linalg.norm(centroid_b)
+                cosine = float(np.dot(centroid_a, centroid_b) / (norm_a * norm_b)) if norm_a > 0 and norm_b > 0 else None
+                delta_norms = np.linalg.norm(deltas, axis=1)
+                mean_delta_l2 = float(delta_norms.mean())
+                mean_delta_rms = float((delta_norms / math.sqrt(deltas.shape[1])).mean())
+            else:
+                cosine = mean_delta_l2 = mean_delta_rms = None
+            layer_metrics.append({
+                "layer": layer_value, "n_pairs": len(pairs_for_layer),
+                "mean_delta_l2": mean_delta_l2, "mean_delta_rms": mean_delta_rms,
+                "centroid_cosine": cosine,
+            })
+
+        hook_mapping = {
+            "resid_pre": "decoder block input (forward pre-hook)",
+            "resid_mid": "post_attention_layernorm input (forward pre-hook)",
+            "resid_post": "decoder block output (forward hook)",
+            "attn_write": "self_attn.o_proj output (forward hook)",
+            "mlp_write": "mlp.down_proj output (forward hook)",
+        }
+        provenance = {key: capture["metadata"].get(key) for key in ("model_id", "revision", "device", "hidden_size", "layers", "points", "window", "family", "template_sha256", "tokenization", "token_position", "causal_context", "capture_dtype", "model_activation_dtypes")}
+        provenance["hook_mapping"] = {name: hook_mapping[name] for name in points}
+        return {
+            "capture_id": capture_id,
+            "integrity_status": capture["job"].get("integrity_status", "verified"),
+            "selected": {"layer": layer, "point": point, "group_a": group_a, "group_b": group_b, "split": split},
+            "provenance": provenance,
+            "layers": layer_metrics,
+            "projection": {
+                "method": "pca", "fit_split": "train", "training_samples": len(training),
+                "rank": int(projection["rank"]),
+                "explained_variance_ratio": projection["explained_variance_ratio"].tolist(),
+                "points": projection_points, "centroids": centroids, "pairs": pair_records,
+                "note": "PCA mean and axes are fit on the selected groups' training rows only. Held-out rows are transformed by those fixed axes. Pair distances use the raw selected-layer vectors.",
+            },
+        }
+
+    def get_capture_sample(self, capture_id: str, sample_id: str) -> dict[str, Any]:
+        capture = self._load_capture(capture_id)
+        if not isinstance(sample_id, str) or not sample_id:
+            raise ResidualServiceError("invalid_input", "sample_id must be a non-empty captured sample ID")
+        sample = next((row for row in capture["dataset"]["samples"] if row["id"] == sample_id), None)
+        if sample is None:
+            raise ResidualServiceError("unknown_sample", "No sample with that ID was found in this capture", 404)
+        return {
+            "capture_id": capture_id,
+            "integrity_status": capture["job"].get("integrity_status", "verified"),
+            "provenance": {key: capture["metadata"].get(key) for key in ("model_id", "revision", "device", "hidden_size", "layers", "points", "window", "family")},
+            "sample": {key: sample[key] for key in ("id", "pair_id", "family_id", "split", "group", "messages", "target", "foil") if key in sample},
+        }
 
     def export_capture(self, capture_id: str) -> Path:
         capture = self._load_capture(capture_id)

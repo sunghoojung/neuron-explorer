@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Neuron Explorer</title>
-<link rel="stylesheet" href="style.css?v=67">
+<link rel="stylesheet" href="style.css?v=68">
+<link rel="stylesheet" href="residual-map.css?v=1">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%23151515%22/%3E%3Ccircle cx=%228%22 cy=%228%22 r=%222.5%22 fill=%22%23ffd27a%22/%3E%3C/svg%3E">
 <script type="importmap">
 {"imports": {
@@ -21,6 +22,7 @@
     <button data-view="residuals">residuals</button>
   </nav>
   <span id="model-id" class="mono" aria-label="model"></span>
+  <span class="seg" id="map-kind" aria-label="Map representation"><button data-map-kind="neurons" class="on">neurons</button><button data-map-kind="residuals">states</button></span>
   <select id="layer" aria-label="layer"></select>
   <span class="seg" id="layout-mode" title="sheet layout"><button data-k="index">index</button><button data-k="writes" class="on">writes</button></span>
   <span class="seg" id="web-mode" title="weight-only candidate links, not causal evidence; yellow and magenta show the estimated link sign"><button data-w="off">no web</button><button data-w="on" class="on">web</button></span><input id="web-z" value="5" inputmode="numeric" aria-label="web top links" title="web: the open neuron's top links each way">
@@ -35,6 +37,7 @@
     <canvas id="map"></canvas>
     <div id="layer-labels"></div>
     <button id="layer-back"></button>
+    <div id="residual-map" hidden></div>
   </section>
   <section id="embed-view" class="view">
     <canvas id="scatter"></canvas>
@@ -108,6 +111,6 @@
     </div>
   </aside>
 </main>
-<script type="module" src="app.js?v=105"></script>
+<script type="module" src="app.js?v=106"></script>
 </body>
 </html>

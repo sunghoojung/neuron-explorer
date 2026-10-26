@@ -141,6 +141,29 @@ def create_residual_router(rt: Any, repo_root: str | Path) -> tuple[APIRouter, R
             return _error(ResidualServiceError("invalid_input", "group_a and group_b must be provided together"))
         return _call(service.get_capture_summary, capture_id, layer=layer, point=point, group_a=group_a, group_b=group_b)
 
+    @router.get("/captures/{capture_id}/map")
+    def capture_map(
+        capture_id: str,
+        layer: int = Query(...),
+        point: str = Query(...),
+        group_a: str = Query(...),
+        group_b: str = Query(...),
+        split: str = Query(default="all"),
+    ) -> Any:
+        return _call(
+            service.get_capture_map,
+            capture_id,
+            layer=layer,
+            point=point,
+            group_a=group_a,
+            group_b=group_b,
+            split=split,
+        )
+
+    @router.get("/captures/{capture_id}/sample")
+    def capture_sample(capture_id: str, sample_id: str = Query(...)) -> Any:
+        return _call(service.get_capture_sample, capture_id, sample_id)
+
     @router.get("/captures/{capture_id}/export")
     def export_capture(capture_id: str) -> Any:
         try:

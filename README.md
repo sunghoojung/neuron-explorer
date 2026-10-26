@@ -42,6 +42,11 @@ and [MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
 ## SOM research
 
+In the original **map** view, switch **neurons / states** to inspect saved residual
+captures on the layer stack. Measured layer strips show raw paired RMS differences;
+the expandable panel shows training-fitted PCA coordinates, matched cases, and saved
+SOM cell memberships. These geometric views do not measure response correctness.
+
 Open [the explorer's residuals view](http://127.0.0.1:8791/#residuals) to
 create matched conversation groups, capture full residual vectors, compare group
 measurements, and fit SOMs on training families. The workspace records token positions

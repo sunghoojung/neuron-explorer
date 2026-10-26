@@ -22,9 +22,9 @@ for (const k in PAL) if (!["bg", "swept", "lo", "hi", "named"].includes(k)) PAL[
 function glowPoints(sizePx, maxScale = 3) {
   return new THREE.RawShaderMaterial({
     uniforms: { size: { value: sizePx * Math.min(devicePixelRatio, 2) }, ref: { value: 1 }, maxScale: { value: maxScale },
-      focusX: { value: 0 }, fadeW: { value: 1 }, fadeAmt: { value: 0 }, camSide: { value: 1 }, tdist: { value: 1 } },
+      focusX: { value: 0 }, fadeW: { value: 1 }, fadeAmt: { value: 0 }, camSide: { value: 1 }, tdist: { value: 1 }, sceneDim: { value: 1 } },
     vertexShader: `precision highp float;
-      uniform mat4 modelViewMatrix, projectionMatrix; uniform float size, ref, maxScale, focusX, fadeW, fadeAmt, camSide, tdist;
+      uniform mat4 modelViewMatrix, projectionMatrix; uniform float size, ref, maxScale, focusX, fadeW, fadeAmt, camSide, tdist, sceneDim;
       attribute vec3 position; attribute vec3 color; varying vec3 vC;
       void main() { float d = (position.x - focusX) / fadeW;
         vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
@@ -37,7 +37,7 @@ function glowPoints(sizePx, maxScale = 3) {
         float keep = mix(1.0, exp(-d * d), fadeAmt * 0.75) * mix(1.0, 1.0 - 0.6 * fadeAmt, front);
         // points nearer than the focus are drawn bigger; dim them by the extra size so they don't outshine it
         float sc = clamp(sqrt(ref / -mv.z), 0.6, maxScale), sc0 = clamp(sqrt(ref / tdist), 0.6, maxScale);
-        vC = color * keep * near * min(1.0, sc0 / sc);
+        vC = color * keep * near * min(1.0, sc0 / sc) * sceneDim;
         gl_PointSize = size * sc; }`,
     fragmentShader: `precision highp float; varying vec3 vC;
       void main() { float r = length(gl_PointCoord - 0.5); if (r > 0.5) discard;
@@ -52,7 +52,15 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.setClearColor(PAL.bg);
   const scene = new THREE.Scene();
+  const residualGroup = new THREE.Group();
+  residualGroup.visible = false;
+  residualGroup.renderOrder = 2;
+  scene.add(residualGroup);
   const layerX = l => l * GAP;
+  let residualRows = [], residualSelectedLayer = null, residualOnSelect = null, residualMode = false;
+  let residualMeshes = [];
+  const RESIDUAL_BASE_Y = -0.76, RESIDUAL_MAX_HEIGHT = 0.58;
+  const RESIDUAL_LOW = new THREE.Color(0x2d8ca1), RESIDUAL_HIGH = new THREE.Color(0xffb852);
   const X0 = ATTN_DX - 1.6, X1 = (L - 1) * GAP + MLP_DX + 1.4;
 
   const insets = { left: 410, right: 0 };
@@ -77,6 +85,65 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     const i = c % gridSide, j = Math.floor(c / gridSide);
     return new THREE.Vector3(layerX(layer) + MLP_DX, SHEET_Y0 + (j / (gridSide - 1)) * SHEET, (i / (gridSide - 1) - 0.5) * SHEET);
   };
+
+  function normalizeResidualRows(rows) {
+    if (!Array.isArray(rows)) return [];
+    const byLayer = new Map();
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const { layer, n_pairs: nPairs, mean_delta_l2: meanDeltaL2, mean_delta_rms: meanDeltaRms, centroid_cosine: centroidCosine } = row;
+      if (!Number.isInteger(layer) || layer < 0 || layer >= L) continue;
+      if (!Number.isSafeInteger(nPairs) || nPairs < 1 || typeof meanDeltaRms !== "number" || !Number.isFinite(meanDeltaRms) || meanDeltaRms < 0) continue;
+      byLayer.set(layer, {
+        layer,
+        n_pairs: nPairs,
+        mean_delta_l2: typeof meanDeltaL2 === "number" && Number.isFinite(meanDeltaL2) && meanDeltaL2 >= 0 ? meanDeltaL2 : null,
+        mean_delta_rms: meanDeltaRms,
+        centroid_cosine: typeof centroidCosine === "number" && Number.isFinite(centroidCosine) ? centroidCosine : null,
+      });
+    }
+    return [...byLayer.values()].sort((a, b) => a.layer - b.layer);
+  }
+
+  function clearResidualStrips() {
+    for (const strip of [...residualGroup.children]) {
+      residualGroup.remove(strip);
+      strip.geometry?.dispose();
+      const materials = Array.isArray(strip.material) ? strip.material : [strip.material];
+      for (const material of materials) material?.dispose();
+    }
+    residualMeshes = [];
+  }
+
+  function rebuildResidualStrips() {
+    clearResidualStrips();
+    if (!residualRows.length) return;
+    const maxRms = Math.max(...residualRows.map(row => row.mean_delta_rms));
+    for (const row of residualRows) {
+      const strength = maxRms > 0 ? THREE.MathUtils.clamp(row.mean_delta_rms / maxRms, 0, 1) : 0;
+      const height = Math.max(0.035, RESIDUAL_MAX_HEIGHT * strength);
+      const selected = row.layer === residualSelectedLayer;
+      const color = RESIDUAL_LOW.clone().lerp(RESIDUAL_HIGH, strength);
+      if (selected) color.lerp(new THREE.Color(0xffffff), 0.24);
+      const strip = new THREE.Mesh(
+        new THREE.BoxGeometry(0.42, height, 1.28),
+        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: selected ? 0.96 : 0.76, depthWrite: false }),
+      );
+      strip.position.set(layerX(row.layer) + MLP_DX, RESIDUAL_BASE_Y + height / 2, 0);
+      strip.renderOrder = 3;
+      strip.userData = { type: "residualLayer", ...row };
+      residualGroup.add(strip);
+      residualMeshes.push(strip);
+
+      const outline = new THREE.LineSegments(
+        new THREE.EdgesGeometry(strip.geometry),
+        new THREE.LineBasicMaterial({ color: selected ? 0xffffff : color.clone().multiplyScalar(0.62), transparent: true, opacity: selected ? 0.95 : 0.6 }),
+      );
+      outline.position.copy(strip.position);
+      outline.renderOrder = 4;
+      residualGroup.add(outline);
+    }
+  }
 
   // every neuron of every layer, one draw call
   const pos = new Float32Array(L * N * 3), col = new Float32Array(L * N * 3);
@@ -134,7 +201,8 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   const wg = new THREE.BufferGeometry(); wg.setAttribute("position", new THREE.Float32BufferAttribute(wires, 3));
   const wireMat = new THREE.LineBasicMaterial({ color: PAL.wire, transparent: true }); wireMat.userData.base = 1;
   scene.add(new THREE.LineSegments(wg, wireMat)); fadeLines.push(wireMat, ...endSlabs);
-  const dataOutline = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: PAL.wireData }));
+  const dataOutline = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: PAL.wireData, transparent: true, depthWrite: false }));
+  dataOutline.material.userData.base = 1;
   dataOutline.frustumCulled = false;
   scene.add(dataOutline);
   const bounds = [];
@@ -325,6 +393,14 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     const r = canvas.getBoundingClientRect();
     mouse.set((ev.clientX - r.left) / r.width * 2 - 1, -(ev.clientY - r.top) / r.height * 2 + 1);
     ray.setFromCamera(mouse, camera);
+    if (residualMode) {
+      const residualHit = ray.intersectObjects(residualMeshes, false)[0];
+      if (residualHit) return { ...residualHit.object.userData };
+      const labelHit = ray.intersectObjects(labels)[0];
+      if (labelHit) return { type: "block", layer: labelHit.object.userData.layer };
+      const slabHit = ray.intersectObjects(slabs)[0];
+      if (slabHit) return { type: "block", ...slabHit.object.userData };
+    }
     // hits come sorted by depth; on a sheet seen at an angle several neighbours fall within the threshold, so take
     // the frontmost layer's hits and pick the point closest to the ray
     const hits = ray.intersectObject(points);
@@ -360,6 +436,14 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     if (!downAt || Math.hypot(ev.clientX - downAt[0], ev.clientY - downAt[1]) > 4) return;
     const p = pick(ev);
     if (p && p.type === "neuron") cb.onPick(p.layer, p.n);
+    else if (p && (p.type === "residualLayer" || residualMode && p.type === "block")) {
+      const layer = p.layer;
+      residualSelectedLayer = layer;
+      rebuildResidualStrips();
+      render();
+      const onSelect = residualOnSelect || cb.onResidualLayer || cb.onLayer;
+      if (onSelect) onSelect(layer);
+    }
     else if (p && p.type === "block" && layerMode === null) enterLayer(p.layer);
   });
 
@@ -391,6 +475,9 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   }
 
   function applyFade() {
+    const sceneDim = residualMode ? 0.28 : 1;
+    pointMat.uniforms.sceneDim.value = sceneDim;
+    residualGroup.visible = residualMode;
     if (layerMode !== null) {
       const fx = layerX(layerMode) + MLP_DX;
       pointMat.uniforms.focusX.value = fx; pointMat.uniforms.fadeW.value = 0.05; pointMat.uniforms.fadeAmt.value = 1;
@@ -421,13 +508,14 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     fade.fx = fx; fade.fw = fw; fade.amt = amt; fade.side = side;
     for (const slab of slabs) {
       const d = (slab.position.x - fx) / fw, f = 1 - amt * (1 - Math.exp(-d * d));
-      slab.material.opacity = slab.userData.baseOpacity * f; slab.userData.edges.material.opacity = f;
+      slab.material.opacity = slab.userData.baseOpacity * f * sceneDim; slab.userData.edges.material.opacity = f * sceneDim;
     }
     for (let l = 0; l < L; l++) {
       const d = (layerX(l) + MLP_DX - fx) / fw;
-      labels[l].material.opacity = labels[l].material.userData.base * (1 - 0.5 * amt * (1 - Math.exp(-d * d)));  // other layers keep half
+      labels[l].material.opacity = labels[l].material.userData.base * (1 - 0.5 * amt * (1 - Math.exp(-d * d))) * sceneDim;  // other layers keep half
     }
-    for (const m of fadeLines) m.opacity = m.userData.base * (1 - 0.9 * amt);
+    for (const m of fadeLines) m.opacity = m.userData.base * (1 - 0.9 * amt) * sceneDim;
+    dataOutline.material.opacity = dataOutline.material.userData.base * sceneDim;
   }
 
   function flyTo(target, dist) {
@@ -461,6 +549,21 @@ export function createMap(canvas, labelsDiv, arch, cb) {
 
   return {
     neuronPos,
+    setResidualLayers(rows, selectedLayer = null, onSelect = null) {
+      residualRows = normalizeResidualRows(rows);
+      residualSelectedLayer = Number.isInteger(selectedLayer) && selectedLayer >= 0 && selectedLayer < L ? selectedLayer : null;
+      residualOnSelect = typeof onSelect === "function" ? onSelect : null;
+      rebuildResidualStrips();
+      render();
+    },
+    setResidualMode(enabled) {
+      const next = Boolean(enabled);
+      if (next === residualMode) return;
+      residualMode = next;
+      if (residualMode && layerMode !== null) exitLayer();
+      applyFade();
+      render();
+    },
     // the swept neurons' colours show on one layer at a time (the current one); the others go back to idle
     setUnits(layer, units) {
       if (unitsLayer !== null && unitsLayer !== layer) for (let n = 0; n < N; n++) PAL.idle.toArray(col, (unitsLayer * N + n) * 3);
