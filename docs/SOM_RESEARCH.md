@@ -53,3 +53,26 @@ Behavior scoring uses the model's conditional continuation sequence log-probabil
 The report includes the false-pressure versus neutral target-minus-foil margin and explicit `true_claim` and `valid_correction` regression diagnostics. Those are guardrails for inspecting whether a projection harms correct-answer preference under truthful claims or corrections. They do not establish general truthfulness, causality, or scientific success. Human review and a suitable, held-out research dataset are still required.
 
 `smoke` creates a tiny synthetic dataset, activation file, SOM artifact, and geometry summary without loading a model or downloading weights. Its output is a plumbing check only. CLI results are compact TOON text; detailed metrics and artifacts are saved to the requested files. Usage errors and data errors include a concise next command.
+
+## Using SOM through the ChatGPT panel
+
+Ask the assistant to check SOM status first. Its tools are:
+
+- `som_status`: list configured paired-prompt sources, validated artifacts, local jobs, and historical external-job records.
+- `som_read_artifact`: inspect a catalogued artifact and its model, revision, layer, and hook metadata.
+- `som_run_pilot`: explicitly start a bounded collection, fit, and held-out evaluation job using the active local model.
+- `som_job_status`: inspect progress and the validated result of a submitted job.
+
+The assistant can run these operations through the explorer even though its shell is read-only.
+A bundled-example pilot is labeled as a plumbing test. It does not replace an existing experiment
+or establish mitigation efficacy. Local output directories are immutable per job and ignored by Git.
+
+Optional local research links live in `explorer/som_sources.local.json`, which is ignored by Git;
+`EXPLORER_SOM_MANIFEST` can select another file. Explicit read-only artifact roots may be configured
+through `EXPLORER_SOM_SOURCE_ROOTS` (paths separated by the platform path separator). Keep private
+paths, job metadata, and unpublished results in local configuration and artifacts.
+
+External scheduler records include the date of the recorded state. A historical pending or
+completed record does not verify the current queue or establish that a SOM was fitted.
+Artifacts from a different pipeline require their exact hook, model, tokenizer, and experimental
+meaning to match. A matching hidden dimension alone is insufficient.

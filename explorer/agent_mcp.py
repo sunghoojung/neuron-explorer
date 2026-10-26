@@ -5,8 +5,10 @@ the Codex CLI MCP integration from server.py with EXPLORER_URL and EXPLORER_CHAT
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
+from urllib.error import HTTPError
 
 URL = os.environ.get("EXPLORER_URL", "http://127.0.0.1:8791")
 CHAT = os.environ.get("EXPLORER_CHAT", "")
@@ -153,18 +155,58 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"neurons": {"type": "array", "items": {
          "type": "object", "properties": {**LN, "sign": {"type": "string", "enum": ["+", "-"]}},
          "required": ["layer", "n"]}}}, "required": ["neurons"]}},
+    {"name": "som_status", "description": "Inspect the configured SOM workflow, paired-prompt sources, validated artifacts, and persisted jobs. "
+     "Shows existing private experiment records separately from the bundled example source when configured. Returns safe summaries and opaque IDs, not file contents or local paths.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "som_read_artifact", "description": "Read the validated metadata and provenance for one existing SOM artifact using its opaque artifact_id from som_status. "
+     "Does not return prototypes, activation data, or arbitrary files.",
+     "inputSchema": {"type": "object", "properties": {"artifact_id": {"type": "string", "minLength": 1, "maxLength": 128}},
+                     "required": ["artifact_id"], "additionalProperties": False}},
+    {"name": "som_run_pilot", "description": "Only invoke when the person explicitly requests a run. Queue one bounded local SOM pilot over a configured paired-prompt source from som_status. Collection captures paired residual activations and rejects sources larger than 24 question IDs (96 condition records); fitting trains only on train-split false_pressure minus neutral deltas; evaluation checks the requested held-out split against controls and is capped separately by max_questions. Uses the active model's exact revision and device, usually MPS on Apple Silicon. This exploratory pilot is not research proof; a run from the bundled example source is a plumbing check only. The server validates the source and layer, writes only under its managed run root, and reports progress through som_job_status. No shell command or filesystem path is accepted.",
+     "inputSchema": {"type": "object", "properties": {
+         "source_id": {"type": "string", "minLength": 1, "maxLength": 128}, "layer": {"type": "integer", "minimum": 0},
+         "rows": {"type": "integer", "minimum": 1, "maximum": 8, "default": 4},
+         "cols": {"type": "integer", "minimum": 1, "maximum": 8, "default": 4},
+         "epochs": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+         "seed": {"type": "integer", "minimum": 0, "maximum": 2147483647, "default": 0},
+         "split": {"type": "string", "enum": ["validation", "test"], "default": "test"},
+         "max_questions": {"type": "integer", "minimum": 1, "maximum": 12, "default": 12}},
+                     "required": ["source_id", "layer"], "additionalProperties": False}},
+    {"name": "som_job_status", "description": "Read persisted progress and safe result metadata for a SOM job ID returned by som_run_pilot. A job is complete only after its artifact, schema, model/layer/hook identity, and output completeness checks pass; queued or interrupted work is not a fitted result. wait_seconds defaults to 10 and is capped at 20 for local active jobs. Historical external records marked unverified return immediately.",
+     "inputSchema": {"type": "object", "properties": {
+         "job_id": {"type": "string", "minLength": 1, "maxLength": 128},
+         "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 20, "default": 10}},
+                     "required": ["job_id"], "additionalProperties": False}},
 ]
 
 
-def get(path, **q):
-    with urllib.request.urlopen(f"{URL}{path}?{urllib.parse.urlencode(q)}", timeout=60) as r:
+def _read_json_response(response):
+    with response as r:
         return json.load(r)
+
+
+def _request_json(request, timeout):
+    try:
+        return _read_json_response(urllib.request.urlopen(request, timeout=timeout))
+    except HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8", errors="replace"))
+        except (ValueError, OSError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        message = body.get("error") or body.get("detail") or f"Explorer request failed with HTTP {exc.code}."
+        raise RuntimeError(str(message)) from None
+
+
+def get(path, **q):
+    query = urllib.parse.urlencode(q)
+    return _request_json(f"{URL}{path}?{query}", timeout=60)
 
 
 def post(path, body, timeout=60):
     req = urllib.request.Request(f"{URL}{path}", json.dumps(body).encode(), {"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
+    return _request_json(req, timeout=timeout)
 
 
 def call(name, a):
@@ -216,7 +258,42 @@ def call(name, a):
         return post("/api/agent/ui", {"chat": CHAT, "action": "select", "layer": a["layer"], "n": a["n"]})
     if name == "highlight_neurons":
         return post("/api/agent/ui", {"chat": CHAT, "action": "highlight", "neurons": a["neurons"]})
+    if name == "som_status":
+        return get("/api/agent/som/status")
+    if name == "som_read_artifact":
+        return get("/api/agent/som/artifact", artifact_id=a["artifact_id"])
+    if name == "som_run_pilot":
+        return post("/api/agent/som/pilot", a)
+    if name == "som_job_status":
+        return som_job_status(a.get("job_id"), a.get("wait_seconds", 10))
     raise ValueError(f"unknown tool {name}")
+
+
+_ACTIVE_LOCAL_SOM_STATUSES = {"queued", "collecting", "fitting", "evaluating", "validating"}
+
+
+def som_job_status(job_id, wait_seconds=10):
+    """Poll active local jobs briefly; historical external records are read once."""
+    if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
+        raise ValueError("job_id must be a non-empty string of at most 128 characters")
+    if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, int) or not 0 <= wait_seconds <= 20:
+        raise ValueError("wait_seconds must be an integer from 0 through 20")
+
+    encoded_job_id = urllib.parse.quote(job_id, safe="")
+    endpoint = f"/api/agent/som/jobs/{encoded_job_id}"
+    deadline = time.monotonic() + wait_seconds
+    result = get(endpoint)
+    while (
+        isinstance(result, dict)
+        and result.get("kind") != "external_record"
+        and result.get("status") in _ACTIVE_LOCAL_SOM_STATUSES
+    ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
+        result = get(endpoint)
+    return result
 
 
 def reply(id_, result=None, error=None):
@@ -226,26 +303,31 @@ def reply(id_, result=None, error=None):
     sys.stdout.flush()
 
 
-for line in sys.stdin:
-    if not line.strip():
-        continue
-    m = json.loads(line)
-    method, id_ = m.get("method"), m.get("id")
-    if id_ is None:
-        continue  # notifications
-    if method == "initialize":
-        reply(id_, {"protocolVersion": m["params"].get("protocolVersion", "2025-06-18"),
-                    "capabilities": {"tools": {}}, "serverInfo": {"name": "explorer", "version": "0.1"}})
-    elif method == "tools/list":
-        reply(id_, {"tools": TOOLS})
-    elif method == "tools/call":
-        p = m["params"]
-        try:
-            out = call(p["name"], p.get("arguments") or {})
-            reply(id_, {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}]})
-        except Exception as e:  # noqa: BLE001 - isolate each MCP tool failure from the protocol loop
-            reply(id_, {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True})
-    elif method == "ping":
-        reply(id_, {})
-    else:
-        reply(id_, error={"code": -32601, "message": f"method not found: {method}"})
+def main():
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        m = json.loads(line)
+        method, id_ = m.get("method"), m.get("id")
+        if id_ is None:
+            continue  # notifications
+        if method == "initialize":
+            reply(id_, {"protocolVersion": m["params"].get("protocolVersion", "2025-06-18"),
+                        "capabilities": {"tools": {}}, "serverInfo": {"name": "explorer", "version": "0.1"}})
+        elif method == "tools/list":
+            reply(id_, {"tools": TOOLS})
+        elif method == "tools/call":
+            p = m["params"]
+            try:
+                out = call(p["name"], p.get("arguments") or {})
+                reply(id_, {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}]})
+            except Exception as e:  # noqa: BLE001 - isolate each MCP tool failure from the protocol loop
+                reply(id_, {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True})
+        elif method == "ping":
+            reply(id_, {})
+        else:
+            reply(id_, error={"code": -32601, "message": f"method not found: {method}"})
+
+
+if __name__ == "__main__":
+    main()

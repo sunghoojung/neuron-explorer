@@ -51,6 +51,10 @@ uv run python -m research.som_pipeline --help
 uv run pytest -q
 ```
 
+The ChatGPT panel can inspect SOM sources and artifacts, launch a bounded pilot through
+`som_run_pilot`, and check its progress through `som_job_status`. It first checks existing
+research through `som_status`. See the guide for ignored local research configuration.
+
 The research pipeline is experimental infrastructure. Successful tests or generation do
 not establish reduced sycophancy, novelty, or publishable results. Evaluate false-pressure
 responses alongside truthful agreement and valid corrections on held-out questions.

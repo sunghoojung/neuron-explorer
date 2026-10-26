@@ -27,3 +27,6 @@ explorer/cache/*/
 research_outputs/
 .pytest_cache/
 .ruff_cache/
+
+# Optional local research links and private run metadata
+explorer/som_sources.local.json

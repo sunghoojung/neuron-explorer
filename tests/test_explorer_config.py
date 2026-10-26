@@ -154,3 +154,37 @@ async def test_chat_rejects_expired_attachment_id(monkeypatch, tmp_path):
     }))
 
     assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_som_pilot_uses_dynamic_layer_bound_and_rejects_out_of_range(monkeypatch):
+    monkeypatch.setattr(server, "ARCH", {"n_layers": 31})
+
+    class SOMService:
+        @staticmethod
+        def start_pilot(**_kwargs):
+            pytest.fail("out-of-range layer must be rejected before queuing a job")
+
+    monkeypatch.setattr(server, "som_service", SOMService())
+    response = await server.agent_som_pilot(JsonRequest({"source_id": "source-opaque", "layer": 31}))
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"] == "layer must be between 0 and 30 for the active model."
+
+
+@pytest.mark.asyncio
+async def test_som_pilot_requires_an_exact_active_model_revision(monkeypatch):
+    monkeypatch.setattr(server, "ARCH", {"n_layers": 31})
+    monkeypatch.setattr(server, "MODEL_REVISION", None)
+    monkeypatch.setattr(server, "current_model_info", lambda: {"model_id": "example/model", "revision": None})
+
+    class SOMService:
+        @staticmethod
+        def start_pilot(**_kwargs):
+            pytest.fail("a pilot without an exact model revision must not be queued")
+
+    monkeypatch.setattr(server, "som_service", SOMService())
+    response = await server.agent_som_pilot(JsonRequest({"source_id": "source-opaque", "layer": 30}))
+
+    assert response.status_code == 409
+    assert "exact revision" in json.loads(response.body)["error"]

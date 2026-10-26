@@ -41,6 +41,7 @@ if os.environ.get("EXPLORER_MODEL") == DEFAULT_MODEL:
 from chatgpt_backend import ChatGPTBackend, ChatHistoryError
 from rank import compute_units
 from runtime import NO_MODEL, Runtime
+from som_service import SOMService, SOMServiceError
 
 PORT = int(os.environ.get("PORT", "8791"))
 RUNS_ROOT, STATS_ROOT = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
@@ -54,7 +55,10 @@ async def lifespan(_app):
         rt.ensure_loaded()
 
     threading.Thread(target=preload_model, daemon=True).start()
-    yield
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(som_service.close)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -84,6 +88,7 @@ async def no_store(request, call_next):
     return resp
 
 rt = Runtime(STATS_ROOT)
+som_service = SOMService(repo_root=ROOT)
 
 
 def current_model_info():
@@ -785,6 +790,114 @@ def agent_overview():
 @app.get("/api/agent/names")
 def agent_names():
     return names()
+
+
+def _som_error_response(exc):
+    """Keep SOM service failures as structured, useful HTTP errors."""
+    if isinstance(exc, SOMServiceError):
+        return JSONResponse({"error": exc.message, "code": exc.code}, status_code=exc.http_status)
+    return JSONResponse({"error": "SOM service request failed."}, status_code=500)
+
+
+@app.get("/api/agent/som/status")
+def agent_som_status():
+    """Summarize configured SOM sources, validated artifacts, active model, and persisted jobs."""
+    try:
+        info = current_model_info()
+        service_info = som_service.status()
+        # Job records are returned in one place below to avoid duplicating them in the MCP payload.
+        service_info.pop("external_jobs", None)
+        return {
+            "service": service_info,
+            "active_model": {
+                "model_id": info.get("model_id") or MODEL_ID,
+                "revision": info.get("revision") or MODEL_REVISION,
+                "n_layers": ARCH.get("n_layers") if ARCH else None,
+                "device": str(getattr(rt, "dev", "cpu")),
+            },
+            "sources": som_service.list_sources(),
+            "artifacts": som_service.list_artifacts(),
+            "jobs": som_service.list_jobs(),
+        }
+    except SOMServiceError as exc:
+        return _som_error_response(exc)
+
+
+@app.get("/api/agent/som/artifact")
+def agent_som_artifact(artifact_id: str):
+    """Read whitelisted metadata for one validated artifact addressed by opaque ID."""
+    try:
+        return som_service.get_artifact(artifact_id)
+    except SOMServiceError as exc:
+        return _som_error_response(exc)
+
+
+@app.get("/api/agent/som/jobs/{job_id}")
+def agent_som_job(job_id: str):
+    """Read persisted progress or the validated result summary for a local SOM job."""
+    try:
+        return som_service.get_job(job_id)
+    except SOMServiceError as exc:
+        return _som_error_response(exc)
+
+
+@app.post("/api/agent/som/pilot")
+async def agent_som_pilot(req: Request):
+    """Queue one bounded collect-fit-evaluate workflow over a configured paired-prompt source."""
+    try:
+        body = await req.json()
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
+    allowed = {"source_id", "layer", "rows", "cols", "epochs", "seed", "split", "max_questions"}
+    extra = sorted(set(body) - allowed)
+    if extra:
+        return JSONResponse({"error": f"Unsupported SOM pilot option: {extra[0]}"}, status_code=400)
+    source_id = body.get("source_id")
+    if not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 128:
+        return JSONResponse({"error": "source_id must be a configured source ID from som_status."}, status_code=400)
+    layer = body.get("layer")
+    if isinstance(layer, bool) or not isinstance(layer, int):
+        return JSONResponse({"error": "layer must be a zero-based integer."}, status_code=400)
+    if not ARCH:
+        return JSONResponse({"error": "Active model architecture metadata is unavailable."}, status_code=503)
+    if not 0 <= layer < ARCH["n_layers"]:
+        return JSONResponse({"error": f"layer must be between 0 and {ARCH['n_layers'] - 1} for the active model."}, status_code=400)
+
+    defaults = {"rows": 4, "cols": 4, "epochs": 100, "seed": 0, "max_questions": 12}
+    bounds = {"rows": (1, 8), "cols": (1, 8), "epochs": (1, 500), "seed": (0, 2**31 - 1), "max_questions": (1, 12)}
+    options = {}
+    for key, default in defaults.items():
+        value = body.get(key, default)
+        lo, hi = bounds[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+            return JSONResponse({"error": f"{key} must be an integer from {lo} through {hi}."}, status_code=400)
+        options[key] = value
+    split = body.get("split", "test")
+    if split not in ("validation", "test"):
+        return JSONResponse({"error": "split must be validation or test."}, status_code=400)
+
+    info = current_model_info()
+    model_id = info.get("model_id") or MODEL_ID
+    revision = info.get("revision") or MODEL_REVISION
+    if not model_id or not revision:
+        return JSONResponse({"error": "The active model must have an exact revision before a SOM pilot can run."}, status_code=409)
+    device = str(getattr(rt, "dev", "cpu"))
+    try:
+        result = await asyncio.to_thread(
+            som_service.start_pilot,
+            source_id=source_id,
+            model_id=model_id,
+            revision=revision,
+            layer=layer,
+            device=device,
+            split=split,
+            **options,
+        )
+        return JSONResponse(result, status_code=202)
+    except SOMServiceError as exc:
+        return _som_error_response(exc)
 
 
 @app.get("/api/agent/neuron")

@@ -16,6 +16,10 @@ Checkpoint: `meta-llama/Llama-3.2-3B-Instruct`, revision
 - ChatGPT panel browser smoke: sent a prompt, observed the explorer overview tool call,
   and received the correct Llama model ID, MPS device, and 28-layer count using the
   existing Codex ChatGPT sign-in.
+- SOM MCP integration: a bounded MPS pilot completed collection, fitting, and one-question
+  evaluation through `som_run_pilot`. The ChatGPT panel called `som_status`,
+  `som_job_status`, and `som_read_artifact` and distinguished local pilot artifacts from
+  historical external job records.
 - Automated tests cover model routing, MPS placement, normalization, hooks, cache isolation,
   non-square neuron grids, data validation, leakage checks, SOM fitting, and projection math.
 
