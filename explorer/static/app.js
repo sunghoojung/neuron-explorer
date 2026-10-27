@@ -1,7 +1,7 @@
 import { createMap } from "./map3d.js?v=71";
 import { createScatter } from "./scatter.js?v=39";
 import { createResidualMap } from "./residual-map.js?v=1";
-import { createAtlasView } from "./atlas-view.js?v=1";
+import { createAtlasView } from "./atlas-view.js?v=2";
 
 const $ = s => document.querySelector(s);
 const api = async (p, body) => {
@@ -213,7 +213,7 @@ document.querySelectorAll("#map-kind button").forEach(button => button.onclick =
   syncMapRepresentation();
 });
 if (location.hash === "#residuals") setView("residuals");
-else if (/^#atlas(?:\/(groups|behavior))?$/.test(location.hash)) {
+else if (/^#atlas(?:\/(groups|behavior|steering))?$/.test(location.hash)) {
   const section = location.hash.split("/")[1] || "groups";
   atlasView.setSection(section, false);
   setView("atlas");
@@ -503,7 +503,7 @@ addEventListener("hashchange", fromHash);
 function fromHash() {
   if (location.hash === "#states") { mapResidualMode = true; setView("map"); return; }
   if (location.hash === "#residuals") { setView("residuals"); return; }
-  const atlasHash = location.hash.match(/^#atlas(?:\/(groups|behavior))?$/);
+  const atlasHash = location.hash.match(/^#atlas(?:\/(groups|behavior|steering))?$/);
   if (atlasHash) { atlasView.setSection(atlasHash[1] || "groups", false); setView("atlas"); return; }
   const m = location.hash.match(/^#L(\d+)\/N(\d+)/);
   if (m && !(state.focus && state.focus.layer === +m[1] && state.focus.n === +m[2])) openNeuron(+m[1], +m[2], "neuron", false);

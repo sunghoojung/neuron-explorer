@@ -6,7 +6,7 @@
 <title>Neuron Explorer</title>
 <link rel="stylesheet" href="style.css?v=68">
 <link rel="stylesheet" href="residual-map.css?v=1">
-<link rel="stylesheet" href="atlas.css?v=1">
+<link rel="stylesheet" href="atlas.css?v=2">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%23151515%22/%3E%3Ccircle cx=%228%22 cy=%228%22 r=%222.5%22 fill=%22%23ffd27a%22/%3E%3C/svg%3E">
 <script type="importmap">
 {"imports": {
@@ -58,32 +58,35 @@
     <div class="atlas-shell">
       <div class="atlas-heading">
         <div>
-          <div class="atlas-eyebrow">sycophancy atlas</div>
-          <h1>Scripted activation maps</h1>
+          <div id="atlas-eyebrow" class="atlas-eyebrow">sycophancy atlas</div>
+          <h1 id="atlas-title">Scripted activation maps</h1>
         </div>
         <nav id="atlas-subnav" aria-label="Atlas views">
           <button data-atlas-view="groups" class="on">groups</button>
           <button data-atlas-view="behavior">behavior</button>
+          <button data-atlas-view="steering" hidden>likelihood screen</button>
         </nav>
       </div>
-      <p class="atlas-caveat"><b>Supplied scripts:</b> these maps show conditional activations, not spontaneous responses.</p>
+      <p id="atlas-main-caveat" class="atlas-caveat"><b>Supplied scripts:</b> these maps show conditional activations, not spontaneous responses.</p>
       <p id="atlas-provenance-note" class="atlas-caveat atlas-synthetic-note" hidden></p>
       <div id="atlas-load-state" class="atlas-load-state" role="status" aria-live="polite">Atlas data has not been loaded.</div>
       <div id="atlas-groups-panel" class="atlas-panel">
         <div class="atlas-controls" aria-label="Atlas map controls">
           <label>atlas<select id="atlas-select" aria-label="atlas"></select></label>
           <label>layer<select id="atlas-layer" aria-label="atlas layer"></select></label>
+          <label id="atlas-map-kind-wrap" hidden>map family<select id="atlas-map-kind" aria-label="map family"></select></label>
           <label>map<select id="atlas-map-view" aria-label="map measure"></select></label>
-          <label>seed<select id="atlas-seed" aria-label="map seed"></select></label>
-          <label>split<select id="atlas-split" aria-label="data split"><option value="train">train</option><option value="eval">eval</option></select></label>
+          <label id="atlas-seed-wrap">seed<select id="atlas-seed" aria-label="map seed"></select></label>
+          <label>split<select id="atlas-split" aria-label="data split"></select></label>
+          <label id="atlas-cohort-wrap" hidden>cohort<select id="atlas-cohort" aria-label="map cohort"><option value="all">synthetic + sources</option><option value="synthetic">synthetic groups</option><option value="source">existing sources</option></select></label>
           <label>color<select id="atlas-color-mode" aria-label="cell coloring"><option value="dominant">dominant group</option><option value="density">group share</option></select></label>
           <label id="atlas-density-wrap" hidden>group<select id="atlas-density-group" aria-label="group share"></select></label>
-          <label>script<select id="atlas-stance" aria-label="teacher-written script"><option value="all">all scripts</option><option value="approval_seeking_script">candidate script</option><option value="independent_script">reference script</option></select></label>
+          <label id="atlas-stance-wrap">script<select id="atlas-stance" aria-label="teacher-written script"><option value="all">all scripts</option><option value="approval_seeking_script">candidate script</option><option value="independent_script">reference script</option></select></label>
         </div>
         <div class="atlas-layout">
           <div class="atlas-map-card">
             <div class="atlas-map-heading"><div><h2 id="atlas-map-title">Group map</h2><div id="atlas-map-meta" class="atlas-dim"></div></div><div id="atlas-map-count" class="atlas-mono"></div></div>
-            <svg id="atlas-hexmap" viewBox="0 0 440 400" role="group" aria-label="Six by six hexagonal self-organizing map"></svg>
+            <svg id="atlas-hexmap" viewBox="0 0 440 400" role="group" aria-label="Hexagonal self-organizing map"></svg>
             <p id="atlas-map-key" class="atlas-dim" style="font-size:11px;margin:0"></p>
             <div id="atlas-map-empty" class="atlas-empty" hidden>No map is available for these settings.</div>
           </div>
@@ -97,6 +100,9 @@
       </div>
       <div id="atlas-behavior-panel" class="atlas-panel" hidden>
         <div id="atlas-behavior-content" class="atlas-behavior-content"></div>
+      </div>
+      <div id="atlas-steering-panel" class="atlas-panel" hidden>
+        <div id="atlas-steering-content" class="atlas-steering-content"></div>
       </div>
     </div>
   </section>
@@ -159,6 +165,6 @@
     </div>
   </aside>
 </main>
-<script type="module" src="app.js?v=107"></script>
+<script type="module" src="app.js?v=108"></script>
 </body>
 </html>
