@@ -118,6 +118,12 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
   function setAtlasChrome(atlas) {
     const transfer = isTransferAtlas(atlas);
     const measured = atlas?.schema === BEHAVIOR_SCHEMA;
+    const noMeasuredMap = measured && atlas.maps.length === 0;
+    root.classList.toggle("atlas-no-map", noMeasuredMap);
+    root.setAttribute("aria-label", measured ? "Natural-response sycophancy behavior atlas" : "Teacher-forced activation atlas");
+    $("#atlas-layer").closest("label").hidden = noMeasuredMap;
+    $("#atlas-cell-detail").closest(".atlas-card").hidden = noMeasuredMap;
+    $("#atlas-legend").closest(".atlas-card").hidden = noMeasuredMap;
     for (const id of ['atlas-map-view', 'atlas-split', 'atlas-color-mode']) $("#" + id).closest('label').hidden = measured;
     $("#atlas-subnav [data-atlas-view='steering']").textContent = measured ? 'behavioral steering' : 'likelihood screen';
     if (measured) {
@@ -128,7 +134,7 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
       $("#atlas-subnav [data-atlas-view='steering']").hidden = false;
       $("#atlas-map-kind-wrap").hidden = true;
       $("#atlas-cohort-wrap").hidden = true;
-      $("#atlas-seed-wrap").hidden = false;
+      $("#atlas-seed-wrap").hidden = noMeasuredMap;
       $("#atlas-density-wrap").hidden = true;
       $("#atlas-stance-wrap").hidden = true;
       $("#atlas-provenance-note").hidden = false;
