@@ -64,6 +64,7 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
     stance: "all",
   };
   let loadPromise = null;
+  let atlasLoadVersion = 0;
 
   function setStatus(message, kind = "") {
     const status = $("#atlas-load-state");
@@ -216,6 +217,7 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
   }
 
   async function loadAtlas(atlasId) {
+    const version = ++atlasLoadVersion;
     state.atlas = null;
     state.atlasId = atlasId;
     $("#atlas-groups-panel").hidden = true;
@@ -224,6 +226,7 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
     setStatus("Verifying atlas contents…");
     try {
       const atlas = await jsonRequest(`/api/atlases/${encodeURIComponent(atlasId)}`);
+      if (version !== atlasLoadVersion) return;
       state.atlas = atlas;
       const transfer = isTransferAtlas(atlas);
       const measured = atlas.schema === BEHAVIOR_SCHEMA;
@@ -262,7 +265,11 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
         : transfer
         ? `${metadata.status} · ${metadata.capture_layers.length} layers · ${atlas.maps?.length || 0} readout maps · ${metadata.device}`
         : `${metadata.sequence_count || 0} scripts · ${metadata.family_count || 0} world families · ${atlas.maps?.length || 0} maps`);
+      const url = new URL(window.location.href);
+      url.searchParams.set("atlas", atlasId);
+      window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
     } catch (error) {
+      if (version !== atlasLoadVersion) return;
       state.atlas = null;
       $("#atlas-groups-panel").hidden = true;
       $("#atlas-behavior-panel").hidden = true;
