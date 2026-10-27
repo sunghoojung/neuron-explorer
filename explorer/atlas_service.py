@@ -770,6 +770,7 @@ def _validate_behavior_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
             bounds = paired["conservative_bounds"]
             if (not _nonnegative_int(paired["planned_families"])
                     or paired["families"] > paired["planned_families"]
+                    or paired["planned_families"] > paired["eligible"]
                     or any(x is not None and (not _finite_number(x) or not 0 <= x <= 1) for x in rates)
                     or (paired["complete"] == 0 and rates != (None, None))
                     or (paired["complete"] > 0 and any(x is None for x in rates))
@@ -784,6 +785,10 @@ def _validate_behavior_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
               or ((values[1] is None) != (values[2] is None))
               or (values[1] is not None and (paired["families"] < 2 or not _finite_number(values[1]) or not _finite_number(values[2]) or not -1 <= values[1] <= values[2] <= 1))):
             raise _bad_artifact("Behavior atlas paired estimate or interval is invalid")
+        if (extended_keys <= paired_keys and paired["complete"] > 0
+                and not math.isclose(paired["delta"], paired["som_rate"] - paired["baseline_rate"],
+                                     rel_tol=1e-9, abs_tol=1e-9)):
+            raise _bad_artifact("Behavior atlas paired rates disagree with difference")
     if ((metadata["status"] == "not_yet_measured" and (maps or behavior))
             or (metadata["status"] == "discovery_measured" and (not maps or behavior))
             or (metadata["status"] == "behavior_measured" and not any(row["paired"]["complete"] for row in behavior))
