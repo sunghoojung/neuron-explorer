@@ -1,4 +1,17 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
+const GROUP_LABELS = {
+  position_verifiable_explicit: "Factual agreement",
+  position_verifiable_implicit: "Uncorrected false premise",
+  position_subjective_explicit: "Opinion agreement",
+  position_subjective_implicit: "Selective framing",
+  person_traits_explicit: "Unearned praise",
+  person_traits_implicit: "Deference in feedback",
+  person_emotions_explicit: "Emotional endorsement",
+  person_emotions_implicit: "Comfort over useful feedback",
+  warranted_correction: "Valid correction",
+  warranted_preference: "Legitimate preference",
+  warm_empathy: "Warm empathy",
+};
 const TRANSFER_SCHEMA = "sycophancy-som-transfer-atlas-v1";
 const SPLIT_NAMES = { train: "train", eval: "eval", validation: "validation", heldout: "held out" };
 const TRANSFER_SPLIT_ORDER = ["train", "validation", "heldout"];
@@ -158,10 +171,12 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
           $("#atlas-steering-panel").hidden = true;
           return;
         }
+        const requestedId = new URLSearchParams(window.location.search).get("atlas");
+        const initialId = state.atlases.find(row => row.id === requestedId)?.id || state.atlases[0].id;
         selectOptions($("#atlas-select"), state.atlases, row => row.id,
-          row => row.run_label || row.title || row.model.split("/").pop().replace("-Instruct", ""), state.atlases[0].id);
+          row => row.run_label || row.title || row.model.split("/").pop().replace("-Instruct", ""), initialId);
         $("#atlas-select").parentElement.hidden = state.atlases.length < 2;
-        await loadAtlas(state.atlases[0].id);
+        await loadAtlas(initialId);
       } catch (error) {
         setStatus(`Atlas data could not be loaded: ${error.message}`, "error");
       } finally {
@@ -183,6 +198,7 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
       state.atlas = atlas;
       const transfer = isTransferAtlas(atlas);
       if (transfer) {
+        atlas.groups = atlas.groups.map(group => ({ ...group, label: GROUP_LABELS[group.id] || group.label }));
         state.layer = atlas.metadata.selected_layer;
         state.mapKind = "prompt_routing";
         state.view = "pre_answer_prompt";
@@ -605,14 +621,14 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
       const button = element("button", `atlas-legend-row${state.colorMode === "density" && state.densityGroup === group.id ? " selected" : ""}`);
       button.type = "button";
       button.title = isTransferAtlas()
-        ? `${group.label} · ${group.is_source_cohort ? "existing source cohort" : group.is_control ? "synthetic control" : "synthetic group"} · ${group.semantic_status || "aggregate only"}`
+        ? `${group.label} · ${group.is_source_cohort ? "existing source cohort" : group.is_control ? "synthetic control" : "synthetic group"} · ${group.is_source_cohort ? "provisional references" : "unreviewed scripts"}`
         : `${group.description}${group.is_control ? " (control)" : ""}`;
       const swatch = element("span", "atlas-swatch");
       swatch.style.backgroundColor = group.color;
       const info = element("span", "atlas-group-label");
       info.append(document.createTextNode(group.label));
       const tagText = isTransferAtlas()
-        ? `${group.is_source_cohort ? "existing source · " : group.is_control ? "synthetic control · " : "synthetic group · "}${group.semantic_status || "aggregate"}`
+        ? `${group.is_source_cohort ? "existing source · " : group.is_control ? "synthetic control · " : "synthetic group · "}${group.is_source_cohort ? "provisional" : "unreviewed"}`
         : `${group.is_control ? "control · " : ""}${group.referent} · ${group.explicitness}`;
       const tags = element("span", `atlas-group-tags${group.is_control ? " atlas-control-tag" : ""}`, tagText);
       info.append(tags);
@@ -722,7 +738,9 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
     host.replaceChildren();
     if (!cell || !state.map) {
       title.textContent = "Select a cell";
-      host.append(element("p", "atlas-dim", "Choose a hexagon to inspect its group composition and scripted examples."));
+      host.append(element("p", "atlas-dim", isTransferAtlas()
+        ? "Choose a hexagon to inspect its groups and steering eligibility."
+        : "Choose a hexagon to inspect its group composition and scripted examples."));
       return;
     }
     const key = cellKey(cell);
