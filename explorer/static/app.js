@@ -2,6 +2,7 @@ import { createMap } from "./map3d.js?v=71";
 import { createScatter } from "./scatter.js?v=39";
 import { createResidualMap } from "./residual-map.js?v=1";
 import { createAtlasView } from "./atlas-view.js?v=2";
+import { createStudyView } from "./som-study.js?v=3";
 
 const $ = s => document.querySelector(s);
 const api = async (p, body) => {
@@ -22,6 +23,7 @@ const atlasView = createAtlasView({
       history.replaceState(null, "", `${location.pathname}${location.search}#atlas/${section}`);
   },
 });
+const studyView = createStudyView(document.querySelector("#study-view"));
 let mapResidualMode = false, residualMap = null, mapUiReady = false;
 const ADD_STEPS = [...Array.from({ length: 30 }, (_, i) => +((i + 1) * 0.05).toFixed(2)), 1.75, 2, 2.5, 3, 4, 5];
 const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12, 16];
@@ -177,6 +179,9 @@ function setView(v) {
   const isAtlas = v === "atlas";
   document.body.classList.toggle("residual-open", v === "residuals");
   document.body.classList.toggle("atlas-open", isAtlas);
+  document.body.classList.toggle("study-open", v === "study");
+  if (v === "study" && location.hash !== "#study") history.replaceState(null, "", `${location.pathname}${location.search}#study`);
+  if (v !== "study" && location.hash === "#study") history.replaceState(null, "", `${location.pathname}${location.search}`);
   if (v === "residuals" && location.hash !== "#residuals") history.replaceState(null, "", `${location.pathname}${location.search}#residuals`);
   if (v !== "residuals" && location.hash === "#residuals") history.replaceState(null, "", `${location.pathname}${location.search}`);
   if (isAtlas && location.hash !== `#atlas/${atlasView.getSection()}`) history.replaceState(null, "", `${location.pathname}${location.search}#atlas/${atlasView.getSection()}`);
@@ -186,6 +191,8 @@ function setView(v) {
   $("#embed-view").classList.toggle("on", v === "embed");
   $("#residuals-view").classList.toggle("on", v === "residuals");
   $("#atlas-view").classList.toggle("on", isAtlas);
+  $("#study-view").classList.toggle("on", v === "study");
+  if (v === "study") studyView.activate();
   if (v === "embed") loadEmbeddings();
   if (v === "residuals") loadResidualWorkspace();
   if (isAtlas) atlasView.activate();
@@ -213,6 +220,7 @@ document.querySelectorAll("#map-kind button").forEach(button => button.onclick =
   syncMapRepresentation();
 });
 if (location.hash === "#residuals") setView("residuals");
+else if (location.hash === "#study") setView("study");
 else if (/^#atlas(?:\/(groups|behavior|steering))?$/.test(location.hash)) {
   const section = location.hash.split("/")[1] || "groups";
   atlasView.setSection(section, false);

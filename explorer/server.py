@@ -57,6 +57,7 @@ from som_service import (
     SOMService,
     SOMServiceError,
 )
+from som_study_api import create_som_study_router
 
 PORT = int(os.environ.get("PORT", "8791"))
 RUNS_ROOT, STATS_ROOT = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
@@ -108,6 +109,7 @@ som_service = SOMService(repo_root=ROOT)
 residual_router, residual_service = create_residual_router(rt, ROOT)
 app.include_router(residual_router)
 app.include_router(create_atlas_router(ROOT))
+app.include_router(create_som_study_router(ROOT))
 
 
 def current_model_info():
