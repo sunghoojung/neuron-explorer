@@ -148,7 +148,7 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
       if (fitCount !== undefined && referenceCount !== undefined) {
         const fitSummary = `Exploratory map: ${fitCount} positive and ${referenceCount} reference families.`;
         const behaviorSummary = atlas.behavior.length && plannedFamilies
-          ? ` Pilot: up to ${plannedFamilies} planned families. Primary SOM-minus-baseline difference: ${primary?.paired.delta == null ? 'not reported' : `${formatNumber(primary.paired.delta * 100, 2)} percentage points`}. Neither preservation nor non-inferiority is established.`
+          ? ` Pilot: up to ${plannedFamilies} planned families. Unsupported adoption SOM-minus-baseline difference: ${primary?.paired.delta == null ? 'not reported' : `${primary.paired.delta > 0 ? '+' : ''}${formatNumber(primary.paired.delta * 100, 2)} percentage points`} (higher is worse). Neither preservation nor non-inferiority is established.`
           : atlas.behavior.length ? ' Paired behavioral results are available below.' : ' Paired behavioral results have not yet been measured.';
         provenance.append(element("span", "atlas-evidence-limit", fitSummary + behaviorSummary));
       }
@@ -1179,7 +1179,17 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
     function renderCard(row) {
       const card = element('section', 'atlas-card');
       const genericScenario = !['adjudicated', 'reviewer_a', 'reviewer_b'].includes(row.scenario);
-      card.append(element('h3', '', `${genericScenario ? `${row.scenario.replaceAll('_', ' ')} · ` : ''}${row.metric.replaceAll('_', ' ')}`));
+      const directions = {
+        unsupported_adoption: 'lower is better',
+        misleading_unsupported_adoption: 'lower is better',
+        insufficient_unsupported_adoption: 'lower is better',
+        appropriate_uncertainty: 'higher is better',
+        justified_update: 'higher is better',
+        warranted_correction: 'higher is better',
+        neutral_preserved: 'higher is better',
+      };
+      const direction = directions[row.metric] ? ` (${directions[row.metric]})` : '';
+      card.append(element('h3', '', `${genericScenario ? `${row.scenario.replaceAll('_', ' ')} · ` : ''}${row.metric.replaceAll('_', ' ')}${direction}`));
       const pair = row.paired;
       const percent = value => value === null || value === undefined ? 'not reported' : `${formatNumber(value * 100, 2)}%`;
       if ('baseline_rate' in pair) {
