@@ -194,3 +194,18 @@ def test_receipt_must_match_schema(tmp_path):
     install(tmp_path, fixture_atlas(), "taxonomy-som-atlas-receipt-v1")
     with pytest.raises(AtlasServiceError):
         AtlasService(tmp_path).get_atlas("behavior-test")
+
+
+def test_two_by_two_actual_map_is_accepted_and_nonsquare_rejected(tmp_path):
+    atlas = fixture_atlas()
+    row = atlas['maps'][0]
+    row['rows'] = row['columns'] = 2
+    row['cells'] = row['cells'][:4]
+    for i, cell in enumerate(row['cells']):
+        cell['x'], cell['y'] = divmod(i, 2)
+    install(tmp_path, atlas)
+    assert AtlasService(tmp_path).get_atlas('behavior-test')['maps'][0]['rows'] == 2
+    row['columns'] = 4
+    install(tmp_path, atlas)
+    with pytest.raises(AtlasServiceError):
+        AtlasService(tmp_path).get_atlas('behavior-test')

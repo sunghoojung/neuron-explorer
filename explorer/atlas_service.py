@@ -693,8 +693,8 @@ def _validate_behavior_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
         if (not isinstance(row["id"], str) or not GROUP_ID_RE.fullmatch(row["id"]) or row["id"] in map_ids
                 or not _nonnegative_int(row["layer"]) or row["layer"] > 1000
                 or not _nonnegative_int(row["seed"]) or row["seed"] > 2**32 - 1
-                or row["rows"] != 4 or not _is_int(row["rows"])
-                or row["columns"] != 4 or not _is_int(row["columns"])
+                or row["rows"] not in (2, 4) or not _is_int(row["rows"])
+                or row["columns"] != row["rows"] or not _is_int(row["columns"])
                 or not all(_nonnegative_int(row[k]) for k in ("fit_count", "fit_family_count", "reference_count", "reference_family_count"))
                 or row["fit_count"] == 0 or row["fit_family_count"] == 0
                 or row["reference_count"] == 0 or row["reference_family_count"] == 0
