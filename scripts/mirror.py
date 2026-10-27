@@ -1,4 +1,10 @@
-import re, sys, os, urllib.parse, concurrent.futures as cf, urllib.request
+import concurrent.futures as cf
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
+
 BASE = "https://already-clean.goodfire.com/"
 OUT = sys.argv[1]
 TEXT_EXT = ('.html','.css','.js','.mjs','.json','.md','.svg','.txt')
@@ -22,9 +28,11 @@ def fetch(u):
             req = urllib.request.Request(u, headers={'User-Agent':'Mozilla/5.0'})
             data = urllib.request.urlopen(req, timeout=60).read()
             os.makedirs(os.path.dirname(lp), exist_ok=True)
-            open(lp,'wb').write(data)
+            with open(lp, 'wb') as handle:
+                handle.write(data)
         if lp.endswith(TEXT_EXT) or lp.endswith('index.html'):
-            txt = open(lp, encoding='utf-8', errors='ignore').read()
+            with open(lp, encoding='utf-8', errors='ignore') as handle:
+                txt = handle.read()
             refs = set()
             for m in ref_re.finditer(txt):
                 for g in m.groups():
@@ -35,7 +43,7 @@ def fetch(u):
                             if r: refs.add(r)
             return u, refs, None
         return u, set(), None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - record each fetch failure and continue the crawl
         return u, set(), str(e)
 frontier = {BASE}
 with cf.ThreadPoolExecutor(24) as ex:
@@ -47,4 +55,5 @@ with cf.ThreadPoolExecutor(24) as ex:
             nxt |= refs - seen
         print(f"fetched {len(frontier)}, total {len(seen)}, next {len(nxt)}, fails {len(fails)}", flush=True)
         frontier = nxt
-open(os.path.join(OUT,'_fails.txt'),'w').write('\n'.join(f"{u}\t{e}" for u,e in fails))
+with open(os.path.join(OUT, '_fails.txt'), 'w') as handle:
+    handle.write('\n'.join(f"{u}\t{e}" for u,e in fails))

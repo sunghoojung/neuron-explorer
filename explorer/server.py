@@ -45,8 +45,8 @@ from model_adapter import (
 
 if os.environ.get("EXPLORER_MODEL") == DEFAULT_MODEL:
     os.environ.setdefault("EXPLORER_REVISION", DEFAULT_REVISION)
-from chatgpt_backend import ChatGPTBackend, ChatHistoryError
 from atlas_api import create_atlas_router
+from chatgpt_backend import ChatGPTBackend, ChatHistoryError
 from rank import compute_units
 from residual_api import create_residual_router
 from runtime import NO_MODEL, Runtime

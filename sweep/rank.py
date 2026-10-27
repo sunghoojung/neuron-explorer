@@ -91,10 +91,10 @@ def main():
     ap.add_argument("--find", default="", help="comma-separated neuron ids to report ranks for")
     a = ap.parse_args()
 
-    records = compute_units([json.loads(l) for l in open(a.jsonl)], a.max_rel, a.top_words)
+    with open(a.jsonl) as handle:
+        records = compute_units([json.loads(line) for line in handle], a.max_rel, a.top_words)
     with open(a.out, "w") as f:
-        for r in records:
-            f.write(json.dumps(r) + "\n")
+        f.writelines(json.dumps(r) + "\n" for r in records)
 
     null = np.sort([r["mass"] for r in records if r["kind"] == "random"])
     neurons = [r for r in records if r["kind"] == "neuron"]

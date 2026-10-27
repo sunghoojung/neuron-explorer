@@ -19,18 +19,21 @@ def main():
     seen, n_in, n_out = set(), 0, 0
     with open(a.out, "w") as f:
         for path in a.inputs:
-            for line in open(path):
-                n_in += 1
-                r = json.loads(line)
-                key = (r["kind"], r["neuron"], r["prompt"], r["dose"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                f.write(line if line.endswith("\n") else line + "\n")
-                n_out += 1
-    meta = json.load(open(a.inputs[0].replace(".jsonl", ".meta.json")))
+            with open(path) as source:
+                for line in source:
+                    n_in += 1
+                    r = json.loads(line)
+                    key = (r["kind"], r["neuron"], r["prompt"], r["dose"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    f.write(line if line.endswith("\n") else line + "\n")
+                    n_out += 1
+    with open(a.inputs[0].replace(".jsonl", ".meta.json")) as source:
+        meta = json.load(source)
     meta["shards"] = [os.path.basename(p) for p in a.inputs]
-    json.dump(meta, open(a.out.replace(".jsonl", ".meta.json"), "w"), indent=1)
+    with open(a.out.replace(".jsonl", ".meta.json"), "w") as target:
+        json.dump(meta, target, indent=1)
     print(f"{n_in} rows in, {n_out} unique -> {a.out}")
 
 

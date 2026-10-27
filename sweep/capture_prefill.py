@@ -31,7 +31,7 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
 
-    tok = AutoTokenizer.from_pretrained(a.model)
+    _tok = AutoTokenizer.from_pretrained(a.model)
     model = Qwen3_5ForConditionalGeneration.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cuda").eval()
     lm = model.model.language_model
     state = {"push_layer": None, "vec": None, "caps": {}, "last": None}
@@ -55,7 +55,8 @@ def main():
         layer.mlp.register_forward_pre_hook(cap_hook(i))
 
     for run in a.runs:
-        meta = json.load(open(run.replace(".jsonl", ".meta.json")))
+        with open(run.replace(".jsonl", ".meta.json")) as handle:
+            meta = json.load(handle)
         layer, cap_layers = meta["layer"], meta["capture_layers"]
         name = os.path.basename(run).replace(".jsonl", "")
         out_path = os.path.join(a.out_dir, f"{name}.mlp_in.npy")
@@ -63,7 +64,8 @@ def main():
             print(f"{name}: exists, skipping", flush=True)
             continue
         w_down = lm.layers[layer].mlp.down_proj.weight.detach().T.float().cpu().numpy()  # [N, hidden]
-        rows = [json.loads(l) for l in open(run)]
+        with open(run) as handle:
+            rows = [json.loads(line) for line in handle]
         n_ctrl = max([r["neuron"] for r in rows if r["kind"] == "random"], default=-1) + 1
         rng = np.random.default_rng(a.seed)
         ctrl_ref = rng.integers(len(w_down), size=n_ctrl)
@@ -73,7 +75,7 @@ def main():
             if r["kind"] == "random":
                 assert r["ref_neuron"] == int(ctrl_ref[r["neuron"]]), "control directions don't match the sweep's seed"
 
-        def vec(r):
+        def vec(r, w_down=w_down, ctrl_vecs=ctrl_vecs):
             if r["kind"] == "neuron":
                 return w_down[r["neuron"]] * r["add"]
             if r["kind"] == "random":
@@ -101,8 +103,9 @@ def main():
         out.flush()
         del out
         os.replace(out_path + ".tmp", out_path)
-        json.dump({"run": name, "capture_layers": cap_layers, "hook": "mlp_in", "position": "last_prompt",
-                   "rows": len(rows)}, open(out_path.replace(".npy", ".json"), "w"))
+        with open(out_path.replace(".npy", ".json"), "w") as handle:
+            json.dump({"run": name, "capture_layers": cap_layers, "hook": "mlp_in", "position": "last_prompt",
+                       "rows": len(rows)}, handle)
         print(f"{name}: {len(rows)} rows, layers {cap_layers}, {time.time() - t0:.0f}s", flush=True)
 
 
