@@ -154,6 +154,27 @@ def test_two_arm_family_weighted_behavior_and_denominators(tmp_path):
         AtlasService(tmp_path).get_atlas("behavior-test")["behavior"]
         == atlas["behavior"]
     )
+    paired = atlas["behavior"][0]["paired"]
+    paired.update(baseline_rate=1.0, som_rate=1.0, planned_families=2, conservative_bounds=[-0.5, 0.5])
+    install(tmp_path, atlas)
+    assert AtlasService(tmp_path).get_atlas("behavior-test")["behavior"] == atlas["behavior"]
+    for field in ("complete", "families"):
+        original = paired[field]
+        paired[field] = "invalid"
+        install(tmp_path, atlas)
+        with pytest.raises(AtlasServiceError):
+            AtlasService(tmp_path).get_atlas("behavior-test")
+        paired[field] = original
+    paired["planned_families"] = 0
+    install(tmp_path, atlas)
+    with pytest.raises(AtlasServiceError):
+        AtlasService(tmp_path).get_atlas("behavior-test")
+    paired["planned_families"] = 2
+    paired["conservative_bounds"] = [0.5, -0.5]
+    install(tmp_path, atlas)
+    with pytest.raises(AtlasServiceError):
+        AtlasService(tmp_path).get_atlas("behavior-test")
+    paired["conservative_bounds"] = [-0.5, 0.5]
     atlas["behavior"][0]["som"]["success"] = 2
     install(tmp_path, atlas)
     with pytest.raises(AtlasServiceError):

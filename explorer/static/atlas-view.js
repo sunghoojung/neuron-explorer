@@ -141,9 +141,22 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
       $("#atlas-provenance-note").hidden = false;
       const provenance = $("#atlas-provenance-note");
       provenance.replaceChildren(document.createTextNode(`${atlas.metadata.model} · ${atlas.metadata.revision}`));
-      for (const caveat of atlas.metadata.not_established) {
-        provenance.append(element("span", "atlas-evidence-limit", caveat));
+      const fitCount = atlas.maps[0]?.fit_family_count;
+      const referenceCount = atlas.maps[0]?.reference_family_count;
+      const plannedFamilies = Math.max(0, ...atlas.behavior.map(row => row.paired.planned_families || 0));
+      const primary = atlas.behavior.find(row => row.scenario === 'adjudicated' && row.metric === 'unsupported_adoption');
+      if (fitCount !== undefined && referenceCount !== undefined) {
+        const fitSummary = `Exploratory map: ${fitCount} positive and ${referenceCount} reference families.`;
+        const behaviorSummary = atlas.behavior.length && plannedFamilies
+          ? ` Pilot: up to ${plannedFamilies} planned families. Primary SOM-minus-baseline difference: ${primary?.paired.delta == null ? 'not reported' : `${formatNumber(primary.paired.delta * 100, 2)} percentage points`}. Neither preservation nor non-inferiority is established.`
+          : atlas.behavior.length ? ' Paired behavioral results are available below.' : ' Paired behavioral results have not yet been measured.';
+        provenance.append(element("span", "atlas-evidence-limit", fitSummary + behaviorSummary));
       }
+      const details = element("details", "atlas-evidence-limit");
+      details.append(element("summary", "", "Full provenance and limitations"));
+      const list = element("ul", "atlas-caveat-list");
+      for (const caveat of atlas.metadata.not_established) list.append(element("li", "", caveat));
+      details.append(list); provenance.append(details);
       return;
     }
     $("#atlas-seed").disabled = false;
@@ -1163,23 +1176,47 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
     host.append(element('h2', 'atlas-section-title', 'Freely generated behavior'));
     host.append(element('p', 'atlas-dim', 'Baseline and SOM-steered answers use matched histories. Labels are provisional model-assisted review.'));
     if (!atlas.behavior.length) host.append(element('p', 'atlas-empty', 'Paired behavioral results have not yet been measured.'));
-    for (const row of atlas.behavior) {
+    function renderCard(row) {
       const card = element('section', 'atlas-card');
-      card.append(element('h3', '', `${row.scenario.replaceAll('_', ' ')} · ${row.metric.replaceAll('_', ' ')}`));
-      for (const [label, arm] of [['Baseline', row.baseline], ['SOM-steered', row.som]]) {
-        const graded = arm.success + arm.other;
-        const result = graded ? `${arm.success} events / ${arm.success + arm.other} graded · ${arm.eligible} eligible` : 'not yet graded';
-        card.append(element('p', '', `${label}: ${result} · ${arm.ungraded} ungraded · ${arm.missing} missing`));
-      }
+      const genericScenario = !['adjudicated', 'reviewer_a', 'reviewer_b'].includes(row.scenario);
+      card.append(element('h3', '', `${genericScenario ? `${row.scenario.replaceAll('_', ' ')} · ` : ''}${row.metric.replaceAll('_', ' ')}`));
       const pair = row.paired;
-      const estimate = pair.delta === null ? 'not yet measured' : formatNumber(pair.delta, 3);
-      const interval = pair.ci_low === null ? 'not reported' : `[${formatNumber(pair.ci_low, 3)}, ${formatNumber(pair.ci_high, 3)}]`;
-      card.append(element('p', '', `Equal-family mean paired branch difference (SOM minus baseline): ${estimate} · interval: ${interval} · ${pair.complete} complete pairs in ${pair.families} families`));
-      host.append(card);
+      const percent = value => value === null || value === undefined ? 'not reported' : `${formatNumber(value * 100, 2)}%`;
+      if ('baseline_rate' in pair) {
+        card.append(element('p', '', `Equal-family rates: baseline ${percent(pair.baseline_rate)} · SOM-steered ${percent(pair.som_rate)}`));
+      }
+      const difference = pair.delta === null ? 'not measured' : `${formatNumber(pair.delta * 100, 2)} percentage points`;
+      const interval = pair.ci_low === null ? 'not reported' : `[${formatNumber(pair.ci_low * 100, 2)}, ${formatNumber(pair.ci_high * 100, 2)}] percentage points`;
+      card.append(element('p', '', `SOM minus baseline: ${difference} · family bootstrap interval: ${interval}`));
+      if (pair.ci_low === 0 && pair.ci_high === 0) card.append(element('p', 'atlas-dim', 'A zero-width bootstrap interval cannot establish preservation or non-inferiority.'));
+      const planned = 'planned_families' in pair ? ` of ${pair.planned_families} planned families` : ' families';
+      card.append(element('p', '', `${pair.complete} complete pairs of ${pair.eligible} planned cases · ${pair.families} complete${planned}`));
+      if ('conservative_bounds' in pair) {
+        const bounds = pair.conservative_bounds;
+        card.append(element('p', '', `Planned-case ambiguity/truncation bounds (descriptive): ${bounds ? `[${formatNumber(bounds[0] * 100, 2)}, ${formatNumber(bounds[1] * 100, 2)}] percentage points` : 'not reported'}`));
+      }
+      for (const [label, arm] of [['Baseline', row.baseline], ['SOM-steered', row.som]]) {
+        card.append(element('p', 'atlas-dim', `${label} branch counts: ${arm.success} events, ${arm.other} other graded, ${arm.ungraded} ungraded, ${arm.missing} missing of ${arm.eligible} planned`));
+      }
+      return card;
     }
+    const main = atlas.behavior.filter(row => row.scenario === 'adjudicated');
+    const sensitivity = atlas.behavior.filter(row => row.scenario === 'reviewer_a' || row.scenario === 'reviewer_b');
+    const other = atlas.behavior.filter(row => !['adjudicated', 'reviewer_a', 'reviewer_b'].includes(row.scenario));
+    for (const row of [...main, ...other]) host.append(renderCard(row));
+    for (const reviewer of ['reviewer_a', 'reviewer_b']) {
+      const rows = sensitivity.filter(row => row.scenario === reviewer);
+      if (!rows.length) continue;
+      const details = element('details', 'atlas-card');
+      details.append(element('summary', '', `${reviewer.replaceAll('_', ' ')} sensitivity review`));
+      for (const row of rows) details.append(renderCard(row));
+      host.append(details);
+    }
+    const caveatDetails = element('details', 'atlas-card');
+    caveatDetails.append(element('summary', '', 'All limitations and provenance notes'));
     const caveats = element('ul', 'atlas-caveat-list');
     for (const text of atlas.metadata.not_established) caveats.append(element('li', '', text));
-    host.append(caveats);
+    caveatDetails.append(caveats); host.append(caveatDetails);
   }
 
   function render() {

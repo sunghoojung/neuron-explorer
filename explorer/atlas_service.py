@@ -753,7 +753,11 @@ def _validate_behavior_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
             counts = _exact_keys(row[arm], {"eligible", "success", "other", "ungraded", "missing"}, "Behavior atlas arm fields are invalid")
             if not all(_nonnegative_int(v) for v in counts.values()) or sum(counts[k] for k in ("success", "other", "ungraded", "missing")) != counts["eligible"]:
                 raise _bad_artifact("Behavior atlas arm denominator is inconsistent")
-        paired = _exact_keys(row["paired"], {"eligible", "complete", "families", "estimand", "delta", "ci_low", "ci_high"}, "Behavior atlas paired fields are invalid")
+        paired_keys = {"eligible", "complete", "families", "estimand", "delta", "ci_low", "ci_high"}
+        extended_keys = {"baseline_rate", "som_rate", "planned_families", "conservative_bounds"}
+        if isinstance(row["paired"], dict) and set(row["paired"]) == paired_keys | extended_keys:
+            paired_keys |= extended_keys
+        paired = _exact_keys(row["paired"], paired_keys, "Behavior atlas paired fields are invalid")
         if (not _nonnegative_int(paired["eligible"]) or not _nonnegative_int(paired["complete"])
                 or not _nonnegative_int(paired["families"]) or paired["families"] > paired["complete"]
                 or paired["estimand"] != "equal_family_mean_branch_difference"
@@ -761,6 +765,17 @@ def _validate_behavior_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
                 or paired["eligible"] != row["baseline"]["eligible"] or paired["eligible"] != row["som"]["eligible"]
                 or paired["complete"] > min(row["baseline"]["success"] + row["baseline"]["other"], row["som"]["success"] + row["som"]["other"])):
             raise _bad_artifact("Behavior atlas paired denominator is inconsistent")
+        if extended_keys <= paired_keys:
+            rates = (paired["baseline_rate"], paired["som_rate"])
+            bounds = paired["conservative_bounds"]
+            if (not _nonnegative_int(paired["planned_families"])
+                    or paired["families"] > paired["planned_families"]
+                    or any(x is not None and (not _finite_number(x) or not 0 <= x <= 1) for x in rates)
+                    or (paired["complete"] == 0 and rates != (None, None))
+                    or (paired["complete"] > 0 and any(x is None for x in rates))
+                    or (bounds is not None and (not isinstance(bounds, list) or len(bounds) != 2
+                        or not all(_finite_number(x) for x in bounds) or not -1 <= bounds[0] <= bounds[1] <= 1))):
+                raise _bad_artifact("Behavior atlas planned-family statistics are invalid")
         values = (paired["delta"], paired["ci_low"], paired["ci_high"])
         if paired["complete"] == 0:
             if any(x is not None for x in values):
