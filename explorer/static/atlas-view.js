@@ -12,6 +12,7 @@ const GROUP_LABELS = {
   warranted_preference: "Legitimate preference",
   warm_empathy: "Warm empathy",
 };
+const BEHAVIOR_SCHEMA = "sycophancy-som-behavior-atlas-v1";
 const TRANSFER_SCHEMA = "sycophancy-som-transfer-atlas-v1";
 const SPLIT_NAMES = { train: "train", eval: "eval", validation: "validation", heldout: "held out" };
 const TRANSFER_SPLIT_ORDER = ["train", "validation", "heldout"];
@@ -72,8 +73,9 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
 
   function setSection(section, notify = true) {
     const transferAtlas = state.atlas?.schema === TRANSFER_SCHEMA;
+    const measuredAtlas = state.atlas?.schema === BEHAVIOR_SCHEMA;
     const allowed = !state.atlas ? ["groups", "behavior", "steering"]
-      : transferAtlas ? ["groups", "steering"] : ["groups", "behavior"];
+      : (transferAtlas || measuredAtlas) ? ["groups", "steering"] : ["groups", "behavior"];
     if (!allowed.includes(section)) section = "groups";
     state.section = section;
     root.querySelectorAll("#atlas-subnav button").forEach(button => {
@@ -86,7 +88,8 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
     $("#atlas-steering-panel").hidden = section !== "steering";
     if (notify) onSectionChange(section);
     if (state.atlas) {
-      if (transferAtlas) renderSteering();
+      if (measuredAtlas) renderMeasuredSteering();
+      else if (transferAtlas) renderSteering();
       else renderBehavior();
     }
   }
@@ -114,6 +117,26 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
 
   function setAtlasChrome(atlas) {
     const transfer = isTransferAtlas(atlas);
+    const measured = atlas?.schema === BEHAVIOR_SCHEMA;
+    for (const id of ['atlas-map-view', 'atlas-split', 'atlas-color-mode']) $("#" + id).closest('label').hidden = measured;
+    $("#atlas-subnav [data-atlas-view='steering']").textContent = measured ? 'behavioral steering' : 'likelihood screen';
+    if (measured) {
+      $("#atlas-eyebrow").textContent = 'natural-response SOM atlas';
+      $("#atlas-title").textContent = atlas.title;
+      $("#atlas-main-caveat").textContent = 'Maps summarize observed natural responses. Labels are provisional model-assisted reviews; learned cells are not individual neurons.';
+      $("#atlas-subnav [data-atlas-view='behavior']").hidden = true;
+      $("#atlas-subnav [data-atlas-view='steering']").hidden = false;
+      $("#atlas-map-kind-wrap").hidden = true;
+      $("#atlas-cohort-wrap").hidden = true;
+      $("#atlas-seed-wrap").hidden = false;
+      $("#atlas-density-wrap").hidden = true;
+      $("#atlas-stance-wrap").hidden = true;
+      $("#atlas-provenance-note").hidden = false;
+      $("#atlas-provenance-note").textContent = `${atlas.metadata.model} · ${atlas.metadata.revision} · provisional model-assisted labels. No final confirmation or non-inferiority established.`;
+      return;
+    }
+    $("#atlas-seed").disabled = false;
+    $("#atlas-map-empty").textContent = "No map is available for these settings.";
     $("#atlas-eyebrow").textContent = transfer ? "prompt-routed SOM atlas" : "sycophancy atlas";
     $("#atlas-title").textContent = transfer ? atlas.title : "Scripted activation maps";
     $("#atlas-main-caveat").replaceChildren();
@@ -197,7 +220,11 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
       const atlas = await jsonRequest(`/api/atlases/${encodeURIComponent(atlasId)}`);
       state.atlas = atlas;
       const transfer = isTransferAtlas(atlas);
-      if (transfer) {
+      const measured = atlas.schema === BEHAVIOR_SCHEMA;
+      if (measured) {
+        state.layer = atlas.maps[0]?.layer ?? 0;
+        state.seed = atlas.maps[0]?.seed ?? 0;
+      } else if (transfer) {
         atlas.groups = atlas.groups.map(group => ({ ...group, label: GROUP_LABELS[group.id] || group.label }));
         state.layer = atlas.metadata.selected_layer;
         state.mapKind = "prompt_routing";
@@ -211,6 +238,7 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
       }
       setAtlasChrome(atlas);
       const availableLayers = [...new Set((atlas.maps || []).map(map => map.layer))].sort((a, b) => a - b);
+      $("#atlas-layer").disabled = availableLayers.length === 0;
       selectOptions($("#atlas-layer"), availableLayers, layer => layer, layer => `L${layer}`,
         availableLayers.includes(state.layer) ? state.layer : availableLayers[0]);
       state.layer = Number($("#atlas-layer").value || availableLayers[0]);
@@ -223,7 +251,9 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
       setSection(state.section, false);
       render();
       const metadata = atlas.metadata || {};
-      setStatus(transfer
+      setStatus(measured
+        ? `${metadata.status.replaceAll('_', ' ')} · ${atlas.maps.length} measured maps · ${metadata.device}`
+        : transfer
         ? `${metadata.status} · ${metadata.capture_layers.length} layers · ${atlas.maps?.length || 0} readout maps · ${metadata.device}`
         : `${metadata.sequence_count || 0} scripts · ${metadata.family_count || 0} world families · ${atlas.maps?.length || 0} maps`);
     } catch (error) {
@@ -1042,8 +1072,106 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
     host.append(caveats);
   }
 
+
+  function renderMeasuredMap() {
+    const atlas = state.atlas;
+    const records = atlas.maps.filter(map => map.layer === state.layer);
+    const seeds = [...new Set(records.map(map => map.seed))].sort((a, b) => a - b);
+    if (!seeds.includes(state.seed)) state.seed = seeds[0] ?? 0;
+    $("#atlas-seed").disabled = seeds.length === 0;
+    selectOptions($("#atlas-seed"), seeds, x => x, x => String(x), state.seed);
+    const map = records.find(row => row.seed === state.seed) || null;
+    state.map = map;
+    const svg = $("#atlas-hexmap");
+    svg.replaceChildren();
+    svg.hidden = !map;
+    $("#atlas-map-empty").hidden = !!map;
+    $("#atlas-map-empty").textContent = 'No discovery map has been measured yet.';
+    $("#atlas-map-title").textContent = map ? `Layer ${map.layer} · seed ${map.seed}` : 'Discovery map not yet measured';
+    $("#atlas-map-meta").textContent = map ? `Fit: ${formatNumber(map.fit_count)} responses from ${formatNumber(map.fit_family_count)} families · reference: ${formatNumber(map.reference_count)} responses from ${formatNumber(map.reference_family_count)} families` : 'No model-derived cells are available.';
+    $("#atlas-map-count").textContent = map ? `${formatNumber(map.cells.reduce((n, c) => n + c.count, 0))} assigned responses` : '';
+    $("#atlas-map-key").textContent = map ? `Cell numbers count assigned responses; select a cell for distinct-family and fit support. Quantization error: ${formatNumber(map.quantization_error, 3)} · topographic error: ${formatNumber(map.topographic_error, 3)}` : '';
+    const coverage = atlas.coverage;
+    const coverageHost = $("#atlas-coverage");
+    coverageHost.replaceChildren();
+    for (const [name, value] of Object.entries(coverage)) coverageHost.append(element('p', '', `${name}: ${formatNumber(value)}`));
+    const legend = $("#atlas-legend");
+    legend.replaceChildren();
+    for (const group of atlas.groups) {
+      const line = element('div', 'atlas-legend-row');
+      const swatch = element('span', 'atlas-swatch'); swatch.style.backgroundColor = group.color;
+      line.append(swatch, element('span', 'atlas-group-label', group.label)); legend.append(line);
+    }
+    const detail = $("#atlas-cell-detail");
+    const selected = map?.cells.find(cell => cell.id === state.selectedCell);
+    $("#atlas-cell-title").textContent = selected ? `Cell ${selected.id}` : 'Select a cell';
+    detail.replaceChildren();
+    if (selected) {
+      detail.append(element('p', '', `${selected.count} responses · ${selected.family_count} distinct families`));
+      detail.append(element('p', '', `Fit support: ${selected.fit_count} responses · ${selected.fit_family_count} families`));
+      for (const [heading, values] of [['Labels', selected.label_counts], ['Scenarios', selected.scenario_counts], ['Sources', selected.source_counts]]) {
+        detail.append(element('h3', '', heading));
+        for (const [key, value] of Object.entries(values)) detail.append(element('p', '', `${key.replaceAll('_', ' ')}: ${value}`));
+      }
+    } else detail.append(element('p', 'atlas-dim', map ? 'Select a cell to inspect support and composition.' : 'Not yet measured.'));
+    if (!map) return;
+    const cells = map.cells, minX = Math.min(...cells.map(c => c.x)), maxX = Math.max(...cells.map(c => c.x));
+    const minY = Math.min(...cells.map(c => c.y)), maxY = Math.max(...cells.map(c => c.y));
+    const scale = 55, radius = 31.75, left = 65, top = 65;
+    svg.setAttribute('viewBox', `0 0 ${Math.ceil(left + (maxX-minX)*scale + 75)} ${Math.ceil(top + (maxY-minY)*scale + 75)}`);
+    for (const cell of cells) {
+      const x = left + (cell.x-minX)*scale, y = top + (maxY-cell.y)*scale;
+      const dominant = Object.entries(cell.label_counts).sort((a,b) => b[1]-a[1])[0];
+      const group = atlas.groups.find(g => g.id === dominant?.[0]);
+      const node = document.createElementNS(SVG_NS, 'g');
+      node.setAttribute('class', `atlas-hex-cell${cell.id === state.selectedCell ? ' selected' : ''}`);
+      node.setAttribute('tabindex', '0'); node.setAttribute('role', 'button');
+      node.setAttribute('aria-label', `Cell ${cell.id}: ${cell.count} responses, ${cell.family_count} families`);
+      const polygon = document.createElementNS(SVG_NS, 'polygon');
+      polygon.setAttribute('points', Array.from({length:6}, (_,i) => { const a=(-90+i*60)*Math.PI/180; return `${x+Math.cos(a)*radius},${y+Math.sin(a)*radius}`; }).join(' '));
+      polygon.setAttribute('fill', group?.color || '#202427');
+      polygon.setAttribute('fill-opacity', cell.count ? '0.8' : '0.12');
+      const text = document.createElementNS(SVG_NS, 'text'); text.setAttribute('x', x); text.setAttribute('y', y+1); text.textContent = String(cell.count);
+      node.append(polygon, text);
+      const pick = () => { state.selectedCell = cell.id; renderMeasuredMap(); };
+      node.addEventListener('click', pick);
+      node.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+      svg.append(node);
+    }
+  }
+
+  function renderMeasuredSteering() {
+    const atlas = state.atlas, host = $("#atlas-steering-content");
+    host.replaceChildren();
+    host.append(element('h2', 'atlas-section-title', 'Freely generated behavior'));
+    host.append(element('p', 'atlas-dim', 'Baseline and SOM-steered answers use matched histories. Labels are provisional model-assisted review.'));
+    if (!atlas.behavior.length) host.append(element('p', 'atlas-empty', 'Paired behavioral results have not yet been measured.'));
+    for (const row of atlas.behavior) {
+      const card = element('section', 'atlas-card');
+      card.append(element('h3', '', `${row.scenario.replaceAll('_', ' ')} · ${row.metric.replaceAll('_', ' ')}`));
+      for (const [label, arm] of [['Baseline', row.baseline], ['SOM-steered', row.som]]) {
+        const graded = arm.success + arm.other;
+        const result = graded ? `${arm.success} events / ${arm.success + arm.other} graded · ${arm.eligible} eligible` : 'not yet graded';
+        card.append(element('p', '', `${label}: ${result} · ${arm.ungraded} ungraded · ${arm.missing} missing`));
+      }
+      const pair = row.paired;
+      const estimate = pair.delta === null ? 'not yet measured' : formatNumber(pair.delta, 3);
+      const interval = pair.ci_low === null ? 'not reported' : `[${formatNumber(pair.ci_low, 3)}, ${formatNumber(pair.ci_high, 3)}]`;
+      card.append(element('p', '', `Equal-family mean paired branch difference (SOM minus baseline): ${estimate} · interval: ${interval} · ${pair.complete} complete pairs in ${pair.families} families`));
+      host.append(card);
+    }
+    const caveats = element('ul', 'atlas-caveat-list');
+    for (const text of atlas.metadata.not_established) caveats.append(element('li', '', text));
+    host.append(caveats);
+  }
+
   function render() {
     if (!state.atlas) return;
+    if (state.atlas.schema === BEHAVIOR_SCHEMA) {
+      renderMeasuredMap();
+      renderMeasuredSteering();
+      return;
+    }
     renderMap();
     if (isTransferAtlas()) renderSteering();
     else renderBehavior();

@@ -18,6 +18,7 @@ SPLITS = {"train", "eval"}
 SOURCE_STATUSES = {"TFonly", "teacher_forced_synthetic_unreviewed"}
 TAXONOMY_ATLAS_SCHEMA = "taxonomy-som-atlas-v1"
 TRANSFER_ATLAS_SCHEMA = "sycophancy-som-transfer-atlas-v1"
+BEHAVIOR_ATLAS_SCHEMA = "sycophancy-som-behavior-atlas-v1"
 TRANSFER_LAYERS = (3, 6, 9, 13, 16, 20, 23, 26)
 TRANSFER_SPLITS = ("train", "validation", "heldout")
 TRANSFER_DATASETS = ("NQ", "QASC", "SQuAD", "VitaminC")
@@ -636,9 +637,152 @@ def _validate_transfer_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
     return atlas
 
 
+def _behavior_count_table(value: Any, total: int, allowed: set[str] | None = None) -> None:
+    if not isinstance(value, dict) or len(value) > 128:
+        raise _bad_artifact("Behavior atlas composition is invalid")
+    for key, count in value.items():
+        if (not isinstance(key, str) or not GROUP_ID_RE.fullmatch(key)
+                or (allowed is not None and key not in allowed) or not _nonnegative_int(count)):
+            raise _bad_artifact("Behavior atlas composition key or count is invalid")
+    if sum(value.values()) != total:
+        raise _bad_artifact("Behavior atlas composition does not partition cell support")
+
+
+def _validate_behavior_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
+    atlas = _exact_keys(atlas, {"schema", "id", "title", "metadata", "provenance", "coverage", "groups", "maps", "behavior"}, "Behavior atlas fields are invalid")
+    if atlas["schema"] != BEHAVIOR_ATLAS_SCHEMA or atlas["id"] != expected_id or not _bounded_string(atlas["title"], maximum=200):
+        raise _bad_artifact("Behavior atlas identity is invalid")
+    metadata = _exact_keys(atlas["metadata"], {"model", "revision", "device", "source_status", "status", "not_established"}, "Behavior atlas metadata is invalid")
+    if (metadata["model"] != "meta-llama/Llama-3.2-3B-Instruct" or metadata["revision"] != "0cb88a4f764b7a12671c53f0838cd831a0843b95"
+            or not _bounded_string(metadata["device"], maximum=64)
+            or metadata["source_status"] != "model_assisted_provisional"
+            or metadata["status"] not in {"not_yet_measured", "discovery_measured", "behavior_measured"}
+            or not isinstance(metadata["not_established"], list) or not 1 <= len(metadata["not_established"]) <= 32
+            or not all(_bounded_string(x, maximum=500) for x in metadata["not_established"])
+            or "confirmation" not in " ".join(metadata["not_established"]).lower()
+            or "non-inferiority" not in " ".join(metadata["not_established"]).lower()):
+        raise _bad_artifact("Behavior atlas provenance or status is invalid")
+    provenance = _exact_keys(atlas["provenance"], {"data_sha256", "labels_sha256", "capture_sha256", "code_sha256"}, "Behavior atlas provenance hashes are invalid")
+    for digest in provenance.values():
+        if digest is not None and (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise _bad_artifact("Behavior atlas provenance hash is invalid")
+    coverage = _exact_keys(atlas["coverage"], {"planned", "generated", "graded", "missing", "ungraded", "families"}, "Behavior atlas coverage is invalid")
+    if (not all(_nonnegative_int(v) for v in coverage.values())
+            or coverage["generated"] + coverage["missing"] != coverage["planned"]
+            or coverage["graded"] + coverage["ungraded"] != coverage["generated"]
+            or coverage["families"] > coverage["generated"]):
+        raise _bad_artifact("Behavior atlas coverage counts are inconsistent")
+    groups = atlas["groups"]
+    if not isinstance(groups, list) or len(groups) > 64:
+        raise _bad_artifact("Behavior atlas groups are invalid")
+    group_ids: set[str] = set()
+    for group in groups:
+        _exact_keys(group, {"id", "label", "color"}, "Behavior atlas group is invalid")
+        if (not isinstance(group["id"], str) or not GROUP_ID_RE.fullmatch(group["id"]) or group["id"] in group_ids
+                or not _bounded_string(group["label"], maximum=160)
+                or not isinstance(group["color"], str) or not HEX_COLOR_RE.fullmatch(group["color"])):
+            raise _bad_artifact("Behavior atlas group values are invalid")
+        group_ids.add(group["id"])
+    maps = atlas["maps"]
+    if not isinstance(maps, list) or len(maps) > 256:
+        raise _bad_artifact("Behavior atlas maps are invalid")
+    map_ids: set[str] = set()
+    layer_seeds: set[tuple[int, int]] = set()
+    for row in maps:
+        _exact_keys(row, {"id", "layer", "seed", "rows", "columns", "cells", "fit_count", "fit_family_count", "reference_count", "reference_family_count", "quantization_error", "topographic_error"}, "Behavior atlas map fields are invalid")
+        if (not isinstance(row["id"], str) or not GROUP_ID_RE.fullmatch(row["id"]) or row["id"] in map_ids
+                or not _nonnegative_int(row["layer"]) or row["layer"] > 1000
+                or not _nonnegative_int(row["seed"]) or row["seed"] > 2**32 - 1
+                or row["rows"] != 4 or not _is_int(row["rows"])
+                or row["columns"] != 4 or not _is_int(row["columns"])
+                or not all(_nonnegative_int(row[k]) for k in ("fit_count", "fit_family_count", "reference_count", "reference_family_count"))
+                or row["fit_count"] == 0 or row["fit_family_count"] == 0
+                or row["reference_count"] == 0 or row["reference_family_count"] == 0
+                or row["fit_family_count"] > min(row["fit_count"], coverage["families"])
+                or row["reference_family_count"] > min(row["reference_count"], coverage["families"])
+                or row["reference_count"] > coverage["graded"]
+                or (row["quantization_error"] is not None and (not _finite_number(row["quantization_error"]) or row["quantization_error"] < 0))
+                or (row["topographic_error"] is not None and (not _finite_number(row["topographic_error"]) or not 0 <= row["topographic_error"] <= 1))
+                or (row["layer"], row["seed"]) in layer_seeds):
+            raise _bad_artifact("Behavior atlas map dimensions or identity are invalid")
+        map_ids.add(row["id"])
+        layer_seeds.add((row["layer"], row["seed"]))
+        cells = row["cells"]
+        if not isinstance(cells, list) or len(cells) != row["rows"] * row["columns"]:
+            raise _bad_artifact("Behavior atlas map cell count is invalid")
+        ids: set[str] = set()
+        positions: set[tuple[float, float]] = set()
+        total = 0
+        total_fit = 0
+        for cell in cells:
+            _exact_keys(cell, {"id", "x", "y", "count", "family_count", "fit_count", "fit_family_count", "label_counts", "scenario_counts", "source_counts"}, "Behavior atlas cell fields are invalid")
+            if (not isinstance(cell["id"], str) or not GROUP_ID_RE.fullmatch(cell["id"]) or cell["id"] in ids
+                    or not _finite_number(cell["x"]) or not _finite_number(cell["y"])
+                    or not -1 <= cell["x"] <= row["columns"] or not 0 <= cell["y"] <= row["rows"]
+                    or (float(cell["x"]), float(cell["y"])) in positions
+                    or not _nonnegative_int(cell["count"]) or not _nonnegative_int(cell["family_count"])
+                    or cell["family_count"] > cell["count"]
+                    or (cell["count"] > 0 and cell["family_count"] == 0)
+                    or not _nonnegative_int(cell["fit_count"]) or not _nonnegative_int(cell["fit_family_count"])
+                    or cell["fit_count"] > cell["count"] or (cell["fit_count"] > 0 and cell["fit_family_count"] == 0)
+                    or cell["fit_family_count"] > min(cell["fit_count"], cell["family_count"])):
+                raise _bad_artifact("Behavior atlas cell values are invalid")
+            ids.add(cell["id"])
+            positions.add((float(cell["x"]), float(cell["y"])))
+            total += cell["count"]
+            total_fit += cell["fit_count"]
+            _behavior_count_table(cell["label_counts"], cell["count"], group_ids)
+            _behavior_count_table(cell["scenario_counts"], cell["count"])
+            _behavior_count_table(cell["source_counts"], cell["count"])
+        if total_fit != row["fit_count"] or row["fit_count"] > total:
+            raise _bad_artifact("Behavior atlas fit counts do not match cells")
+        if total > coverage["graded"]:
+            raise _bad_artifact("Behavior atlas map support exceeds graded coverage")
+    behavior = atlas["behavior"]
+    if not isinstance(behavior, list) or len(behavior) > 128:
+        raise _bad_artifact("Behavior atlas result collection is invalid")
+    metrics: set[tuple[str, str]] = set()
+    for row in behavior:
+        _exact_keys(row, {"scenario", "metric", "baseline", "som", "paired"}, "Behavior atlas result fields are invalid")
+        if (not isinstance(row["scenario"], str) or not GROUP_ID_RE.fullmatch(row["scenario"])
+                or not isinstance(row["metric"], str) or not GROUP_ID_RE.fullmatch(row["metric"])
+                or (row["scenario"], row["metric"]) in metrics):
+            raise _bad_artifact("Behavior atlas result identity is invalid")
+        metrics.add((row["scenario"], row["metric"]))
+        for arm in ("baseline", "som"):
+            counts = _exact_keys(row[arm], {"eligible", "success", "other", "ungraded", "missing"}, "Behavior atlas arm fields are invalid")
+            if not all(_nonnegative_int(v) for v in counts.values()) or sum(counts[k] for k in ("success", "other", "ungraded", "missing")) != counts["eligible"]:
+                raise _bad_artifact("Behavior atlas arm denominator is inconsistent")
+        paired = _exact_keys(row["paired"], {"eligible", "complete", "families", "estimand", "delta", "ci_low", "ci_high"}, "Behavior atlas paired fields are invalid")
+        if (not _nonnegative_int(paired["eligible"]) or not _nonnegative_int(paired["complete"])
+                or not _nonnegative_int(paired["families"]) or paired["families"] > paired["complete"]
+                or paired["estimand"] != "equal_family_mean_branch_difference"
+                or (paired["complete"] > 0 and paired["families"] == 0)
+                or paired["eligible"] != row["baseline"]["eligible"] or paired["eligible"] != row["som"]["eligible"]
+                or paired["complete"] > min(row["baseline"]["success"] + row["baseline"]["other"], row["som"]["success"] + row["som"]["other"])):
+            raise _bad_artifact("Behavior atlas paired denominator is inconsistent")
+        values = (paired["delta"], paired["ci_low"], paired["ci_high"])
+        if paired["complete"] == 0:
+            if any(x is not None for x in values):
+                raise _bad_artifact("Unmeasured paired outcome must not report estimates")
+        elif (not _finite_number(values[0]) or not -1 <= values[0] <= 1
+              or ((values[1] is None) != (values[2] is None))
+              or (values[1] is not None and (paired["families"] < 2 or not _finite_number(values[1]) or not _finite_number(values[2]) or not -1 <= values[1] <= values[2] <= 1))):
+            raise _bad_artifact("Behavior atlas paired estimate or interval is invalid")
+    if ((metadata["status"] == "not_yet_measured" and (maps or behavior))
+            or (metadata["status"] == "discovery_measured" and (not maps or behavior))
+            or (metadata["status"] == "behavior_measured" and not any(row["paired"]["complete"] for row in behavior))
+            or (maps and not all(provenance.values()))
+            or (behavior and not all(provenance.values()))):
+        raise _bad_artifact("Behavior atlas status disagrees with measured data or provenance")
+    return atlas
+
+
 def _validate_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
     if not isinstance(atlas, dict):
         raise _bad_artifact("Atlas must be a JSON object")
+    if atlas.get("schema") == BEHAVIOR_ATLAS_SCHEMA:
+        return _validate_behavior_atlas(atlas, expected_id)
     if atlas.get("schema") == TAXONOMY_ATLAS_SCHEMA:
         return _validate_taxonomy_atlas(atlas, expected_id)
     if atlas.get("schema") == TRANSFER_ATLAS_SCHEMA:
@@ -706,7 +850,7 @@ class AtlasService:
             raise _bad_artifact("Atlas receipt fields are invalid")
         expected_hash = receipt.get("atlas_sha256")
         expected_size = receipt.get("atlas_bytes")
-        if (receipt.get("schema") != "taxonomy-som-atlas-receipt-v1"
+        if (receipt.get("schema") not in {"taxonomy-som-atlas-receipt-v1", "sycophancy-som-behavior-atlas-receipt-v1"}
                 or receipt.get("id") != atlas_id
                 or not isinstance(expected_hash, str)
                 or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
@@ -720,6 +864,9 @@ class AtlasService:
             atlas = json.loads(raw, object_pairs_hook=_object_no_duplicates)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             raise _bad_artifact("Atlas file is not valid JSON") from None
+        expected_receipt = "sycophancy-som-behavior-atlas-receipt-v1" if isinstance(atlas, dict) and atlas.get("schema") == BEHAVIOR_ATLAS_SCHEMA else "taxonomy-som-atlas-receipt-v1"
+        if receipt["schema"] != expected_receipt:
+            raise _bad_artifact("Atlas receipt schema does not match atlas schema")
         return _validate_atlas(atlas, atlas_id), receipt, actual_hash, len(raw)
 
     def get_atlas(self, atlas_id: str) -> dict[str, Any]:
