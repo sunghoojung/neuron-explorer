@@ -306,7 +306,7 @@ body.list-hidden #layer-back { left: 56px; }
 tr.con .logit { margin-top: 2px; opacity: .5; }
 tr.con .logit .tok { font-size: 10.5px; }
 
-/* ChatGPT's annotations on the map: .note is a zero-size anchor at the neuron */
+/* Claude's annotations on the map: .note is a zero-size anchor at the neuron */
 #layer-labels .note { position: absolute; width: 0; height: 0; pointer-events: none; }
 #layer-labels .note::before { content: ""; position: absolute; left: -7px; top: -7px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid #ffd133; }
 #layer-labels .note span { position: absolute; left: 12px; top: 0; transform: translateY(-50%); white-space: nowrap; max-width: 260px; overflow: hidden; text-overflow: ellipsis;

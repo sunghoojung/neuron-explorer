@@ -39,3 +39,14 @@ def test_wrong_schema_rejected(tmp_path, schema):
     response = client(tmp_path).get("/api/som-study")
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "study_invalid"
+
+
+def test_neuron_alignment_route(tmp_path):
+    from explorer.som_study_api import ALIGNMENT_SCHEMA
+
+    assert client(tmp_path).get("/api/som-study/neurons").status_code == 404
+    path = tmp_path / "research_outputs" / "som_study" / "neuron-alignment-v1.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"schema": ALIGNMENT_SCHEMA, "directions": {}}))
+    response = client(tmp_path).get("/api/som-study/neurons")
+    assert response.status_code == 200 and response.json()["schema"] == ALIGNMENT_SCHEMA

@@ -10,6 +10,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 STUDY_SCHEMA = "som-steering-study-v1"
+ALIGNMENT_SCHEMA = "som-neuron-write-alignment-v1"
 HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
 
 
@@ -38,5 +39,20 @@ def create_som_study_router(repo_root: str | Path) -> APIRouter:
                 {"error": {"code": "study_invalid", "message": str(error)}},
                 status_code=500, headers=HEADERS,
             )
+
+    @router.get("/neurons")
+    def get_neurons() -> Any:
+        path = Path(repo_root) / "research_outputs" / "som_study" / "neuron-alignment-v1.json"
+        try:
+            data = json.loads(path.read_bytes())
+        except FileNotFoundError:
+            return JSONResponse(
+                {"error": {"code": "alignment_missing", "message": "Run research/build_som_neuron_alignment.py first."}},
+                status_code=404, headers=HEADERS,
+            )
+        if data.get("schema") != ALIGNMENT_SCHEMA:
+            return JSONResponse({"error": {"code": "alignment_invalid", "message": "unexpected alignment schema"}},
+                                status_code=500, headers=HEADERS)
+        return JSONResponse(data, headers=HEADERS)
 
     return router

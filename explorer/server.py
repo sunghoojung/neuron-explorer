@@ -46,7 +46,8 @@ from model_adapter import (
 if os.environ.get("EXPLORER_MODEL") == DEFAULT_MODEL:
     os.environ.setdefault("EXPLORER_REVISION", DEFAULT_REVISION)
 from atlas_api import create_atlas_router
-from chatgpt_backend import ChatGPTBackend, ChatHistoryError
+from chatgpt_backend import ChatGPTBackend
+from claude_backend import ChatHistoryError, ClaudeBackend
 from rank import compute_units
 from residual_api import create_residual_router
 from runtime import NO_MODEL, Runtime
@@ -82,7 +83,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 # only this machine's own pages and tools: a page on another site (or a DNS name rebound to 127.0.0.1) can't reach
-# the API, which runs the local model and ChatGPT's cloud-backed chat
+# the API, which runs the local model and the cloud-backed assistant chat
 LOCAL_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}", f"[::1]:{PORT}"}
 
 
@@ -779,7 +780,7 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
             "up": {"neurons": len(up), "fed_by": pool(up, 1), "held_by": pool(up, -1)}}
 
 
-# ---------- ChatGPT: autointerpretation and chat ----------
+# ---------- Claude: autointerpretation and chat ----------
 # Each conversation is stored in the model-scoped explorer cache. The MCP server reads through the endpoints below and
 # sends map actions back through /api/agent/ui into the active browser stream.
 AGENT_PROMPT = os.path.join(ROOT, "explorer", "agent_prompt.md")
@@ -1390,7 +1391,7 @@ def _live_off():
 
 @app.post("/api/agent/steer")
 async def agent_steer(req: Request):
-    """Steered rollouts for ChatGPT: one prompt, greedy, pushed up / unsteered / pushed down; whole texts at once."""
+    """Steered rollouts for Claude: one prompt, greedy, pushed up / unsteered / pushed down; whole texts at once."""
     b = await req.json()
     if off := _live_off():
         return off
@@ -1411,7 +1412,7 @@ async def agent_steer(req: Request):
 
 @app.post("/api/agent/activations")
 async def agent_activations(req: Request):
-    """The neuron's activation on each token of a text, for ChatGPT; compact [token, activation] pairs. With `neurons`
+    """The neuron's activation on each token of a text, for Claude; compact [token, activation] pairs. With `neurons`
     ([{layer, n, dose?, mode?}]) those are pushed during the same pass (steering units)."""
     b = await req.json()
     if off := _live_off():
@@ -1454,7 +1455,7 @@ def _interventions(b):
 
 @app.post("/api/agent/logprobs")
 async def agent_logprobs(req: Request):
-    """For ChatGPT: the next token's distribution after a text. Body {text, chat?, prefix?, k?, targets?: [str],
+    """For Claude: the next token's distribution after a text. Body {text, chat?, prefix?, k?, targets?: [str],
     neurons?, heads?} (neurons / heads as in /api/agent/activations). Without an intervention: {top, targets}. With
     one: baseline and intervened {top, targets}, kl (nats, baseline to intervened) and the tokens that gained and lost
     the most probability over the whole vocabulary."""
@@ -1493,7 +1494,7 @@ async def agent_logprobs(req: Request):
 
 @app.post("/api/agent/compare")
 async def agent_compare(req: Request):
-    """For ChatGPT: many neurons read across several texts, one forward pass per text. Body {neurons: [{layer, n}],
+    """For Claude: many neurons read across several texts, one forward pass per text. Body {neurons: [{layer, n}],
     texts: [text | {label, text}], chat?}. Per neuron and text: the strongest positive and negative activation with
     its token, and the peak score (activation over the neuron's usual extreme; position 0, the sink, left out)."""
     b = await req.json()
@@ -1522,7 +1523,7 @@ async def agent_compare(req: Request):
 
 @app.post("/api/agent/fires")
 async def agent_fires(req: Request):
-    """For ChatGPT: run text through the model and list the neurons firing hardest at one token (the first whose text
+    """For Claude: run text through the model and list the neurons firing hardest at one token (the first whose text
     contains `token`, else the token where any neuron fires hardest). Leaves the person's paste box alone."""
     b = await req.json()
     if off := _live_off():
@@ -1591,7 +1592,7 @@ def _persist_agent_upload(fid, name, content_type, raw):
 
 
 def attachment_inputs(fid):
-    """Return text for a document attachment or a local image path for Codex CLI."""
+    """Return text for a document attachment or a local image path for the chat CLI."""
     fid = os.path.basename(str(fid))
     meta_path = os.path.join(UPLOADS, f"{fid}.json")
     if not os.path.exists(meta_path):
@@ -1632,16 +1633,30 @@ def agent_prompt_file():
     return out
 
 
-chat_backend = ChatGPTBackend(
-    os.path.join(ROOT, "explorer", "cache"),
-    CACHE_NAMESPACE,
-    codex_bin=os.environ.get("EXPLORER_CODEX_BIN", "codex"),
-    model=os.environ.get("EXPLORER_CODEX_MODEL"),
-    cwd=AGENT_DIR,
-    mcp_command=sys.executable,
-    mcp_args=(os.path.join(ROOT, "explorer", "agent_mcp.py"),),
-    mcp_env={"EXPLORER_URL": f"http://127.0.0.1:{PORT}"},
-)
+_chat_kwargs = {
+    "cwd": AGENT_DIR,
+    "mcp_command": sys.executable,
+    "mcp_args": (os.path.join(ROOT, "explorer", "agent_mcp.py"),),
+    "mcp_env": {"EXPLORER_URL": f"http://127.0.0.1:{PORT}"},
+}
+# Claude (the local `claude` CLI and its Claude Code login) is the chat transport. EXPLORER_CHAT_BACKEND=codex keeps
+# the older Codex CLI transport selectable; both read and write the same model-scoped chat history.
+if os.environ.get("EXPLORER_CHAT_BACKEND", "claude").lower() == "codex":
+    chat_backend = ChatGPTBackend(
+        os.path.join(ROOT, "explorer", "cache"),
+        CACHE_NAMESPACE,
+        codex_bin=os.environ.get("EXPLORER_CODEX_BIN", "codex"),
+        model=os.environ.get("EXPLORER_CODEX_MODEL"),
+        **_chat_kwargs,
+    )
+else:
+    chat_backend = ClaudeBackend(
+        os.path.join(ROOT, "explorer", "cache"),
+        CACHE_NAMESPACE,
+        claude_bin=os.environ.get("EXPLORER_CLAUDE_BIN", "claude"),
+        model=os.environ.get("EXPLORER_CLAUDE_MODEL") or None,
+        **_chat_kwargs,
+    )
 
 
 @app.post("/api/agent/rewind")

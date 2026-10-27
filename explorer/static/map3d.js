@@ -279,6 +279,50 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   const markPts = new THREE.Points(markGeo, glowPoints(4, 2));
   markPts.frustumCulled = false; markPts.renderOrder = 1;
   scene.add(markPts);
+  // SOM overlay: neurons coloured by how their writes align with a SOM direction, plus per-layer bars
+  const somGeo = new THREE.BufferGeometry();
+  const somPts = new THREE.Points(somGeo, glowPoints(4.5, 2.5));
+  somPts.frustumCulled = false; somPts.renderOrder = 2;
+  scene.add(somPts);
+  const somBars = new THREE.Group();
+  scene.add(somBars);
+  let somMarks = [];
+  const SOM_BAR_TOP = -0.95, SOM_BAR_MAX = 1.1;
+  function drawSomMarks() {
+    const p = [], c = [];
+    for (const m of somMarks) {
+      const v = neuronPos(m.layer, m.n), k = new THREE.Color(...m.color).multiplyScalar(m.w ?? 1);
+      p.push(v.x, v.y, v.z); c.push(k.r, k.g, k.b);
+    }
+    somGeo.setAttribute("position", new THREE.Float32BufferAttribute(p, 3));
+    somGeo.setAttribute("color", new THREE.Float32BufferAttribute(c, 3));
+  }
+  function drawSomBars(rows) {
+    for (const child of [...somBars.children]) {
+      somBars.remove(child); child.geometry?.dispose();
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      for (const mat of mats) { mat?.map?.dispose(); mat?.dispose(); }
+    }
+    for (const row of rows || []) {
+      const h = Math.max(0.03, SOM_BAR_MAX * THREE.MathUtils.clamp(row.score, 0, 1));
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(0.34, h, 0.9),
+        new THREE.MeshBasicMaterial({ color: new THREE.Color(...row.color), transparent: true, opacity: row.emphasis ? 0.95 : 0.6, depthWrite: false }));
+      bar.position.set(layerX(row.layer) + MLP_DX, SOM_BAR_TOP - h / 2, 0);
+      bar.renderOrder = 3;
+      somBars.add(bar);
+      if (row.label) {
+        const cv = document.createElement("canvas"), ctx = cv.getContext("2d"), font = "600 56px ui-monospace, Menlo, monospace";
+        ctx.font = font; const tw = Math.ceil(ctx.measureText(row.label).width) + 8;
+        cv.width = tw; cv.height = 72; ctx.font = font; ctx.fillStyle = "#fff"; ctx.textBaseline = "middle"; ctx.fillText(row.label, 4, 38);
+        const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+        const lh = 0.24, w = lh * tw / 72;
+        const label = new THREE.Mesh(new THREE.PlaneGeometry(w, lh), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide, color: 0xe6c27a }));
+        label.rotation.y = Math.PI / 2;
+        label.position.set(layerX(row.layer) + MLP_DX, SOM_BAR_TOP - h - 0.22, 0);
+        somBars.add(label);
+      }
+    }
+  }
 
   function refreshHighlights() {
     const p = [], c = [];
@@ -476,7 +520,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
 
   function applyFade() {
     const sceneDim = residualMode ? 0.28 : 1;
-    pointMat.uniforms.sceneDim.value = sceneDim;
+    pointMat.uniforms.sceneDim.value = sceneDim * (somMarks.length ? 0.22 : 1);
     residualGroup.visible = residualMode;
     if (layerMode !== null) {
       const fx = layerX(layerMode) + MLP_DX;
@@ -611,6 +655,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     setLayout(cells) {
       layoutCells = cells;
       this.setMarks(lastMarks);
+      drawSomMarks();
       for (let l = 0; l < L; l++) for (let n = 0; n < N; n++) {
         const p = neuronPos(l, n), k = (l * N + n) * 3;
         pos[k] = p.x; pos[k + 1] = p.y; pos[k + 2] = p.z;
@@ -638,6 +683,13 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       }
       markGeo.setAttribute("position", new THREE.Float32BufferAttribute(p, 3));
       markGeo.setAttribute("color", new THREE.Float32BufferAttribute(c, 3));
+      render();
+    },
+    setSomOverlay(overlay) {
+      somMarks = overlay?.marks || [];
+      drawSomMarks();
+      drawSomBars(overlay?.layers || []);
+      applyFade();
       render();
     },
     setInsets(left, right) { insets.left = left; insets.right = right; resize(); },
