@@ -24,6 +24,7 @@ body.atlas-open #layer-back { display: none !important; }
 #atlas-subnav button[hidden] { display: none !important; }
 .atlas-caveat { margin: 0 0 14px; padding: 8px 11px; border-left: 2px solid #9a7d4c; background: rgba(255, 210, 122, .055); color: #b7aa93; font-size: 12px; }
 .atlas-caveat b { color: #e1c891; font-weight: 500; }
+.atlas-evidence-limit { display: block; margin-top: 4px; }
 .atlas-synthetic-note { border-left-color: #706450; background: rgba(190, 163, 106, .04); }
 .atlas-load-state { margin: 10px 0 14px; color: var(--dim); font-size: 12px; }
 .atlas-load-state:empty { display: none; }

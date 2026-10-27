@@ -139,7 +139,11 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
       $("#atlas-density-wrap").hidden = true;
       $("#atlas-stance-wrap").hidden = true;
       $("#atlas-provenance-note").hidden = false;
-      $("#atlas-provenance-note").textContent = `${atlas.metadata.model} · ${atlas.metadata.revision} · provisional model-assisted labels. No final confirmation or non-inferiority established.`;
+      const provenance = $("#atlas-provenance-note");
+      provenance.replaceChildren(document.createTextNode(`${atlas.metadata.model} · ${atlas.metadata.revision}`));
+      for (const caveat of atlas.metadata.not_established) {
+        provenance.append(element("span", "atlas-evidence-limit", caveat));
+      }
       return;
     }
     $("#atlas-seed").disabled = false;
