@@ -50,3 +50,38 @@ It exposes no model execution or fitting action.
 `GET /api/atlases/<atlas-id>` returns a verified atlas, bounded to 32 MiB.
 The optional `metadata.behavior_summary` holds a distinct preference-study
 table, its endpoint, denominators, conclusion, and caveats.
+
+## Prompt-routed transfer screen
+
+The same explorer also accepts `sycophancy-som-transfer-atlas-v1` artifacts.
+Open `/#atlas/groups` for prompt-state and descriptive output maps, or
+`/#atlas/steering` for the teacher-forced likelihood screen. The run selector
+uses each artifact's display title and ID so runs with the same model name stay
+distinct.
+
+Transfer atlases use a row-major 4 by 4 hexagonal map at layers 3, 6, 9, 13,
+16, 20, 23, and 26. `prompt_routing` maps use the pre-answer prompt state and
+are the only map family marked route-eligible. `output_contrast` maps show
+answer-mean or shared-suffix contrasts for description only. The layer,
+readout, split, and cohort controls are populated from the installed map
+descriptors. The cell edge marks the frozen training routing gate; source
+cohort counts remain separate from synthetic group counts.
+
+The strict transfer schema contains bounded cell coordinates and aggregate
+counts for train, validation, and held-out splits. Per-cell synthetic groups,
+existing-source collections, and routing eligibility are validated as
+partitions of the corresponding totals. `coverage` reports synthetic pair,
+row, and family counts separately from existing-source component and pair
+counts. The likelihood summary includes a validation layer/strength grid and
+held-out arm, group, control, and source-collection aggregates. Its metric is
+teacher-forced likelihood, so it is a score surrogate rather than evidence of
+free-generation behavior or causal efficacy. The bounded `metadata.not_established`
+list is shown under that heading in the results view.
+
+The transfer atlas has no prompt examples, generated responses, or raw point
+records. Logical codebook and BMU references are checked as identifiers only;
+the API does not resolve or serve their local audit artifacts. Both atlas
+formats use the existing `taxonomy-som-atlas-receipt-v1` envelope, which binds
+the exact `atlas.json` bytes by SHA-256 and byte length. The transfer validator
+checks the new schema without changing validation of installed six by six
+taxonomy atlases.

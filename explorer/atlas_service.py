@@ -16,6 +16,26 @@ HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 MAP_VIEWS = {"answer_mean", "shared_suffix", "paired_delta"}
 SPLITS = {"train", "eval"}
 SOURCE_STATUSES = {"TFonly", "teacher_forced_synthetic_unreviewed"}
+TAXONOMY_ATLAS_SCHEMA = "taxonomy-som-atlas-v1"
+TRANSFER_ATLAS_SCHEMA = "sycophancy-som-transfer-atlas-v1"
+TRANSFER_LAYERS = (3, 6, 9, 13, 16, 20, 23, 26)
+TRANSFER_SPLITS = ("train", "validation", "heldout")
+TRANSFER_DATASETS = ("NQ", "QASC", "SQuAD", "VitaminC")
+TRANSFER_CLAIM_CEILING = (
+    "A held-out shift in the conditional likelihood margin of the frozen authored response scripts "
+    "under a prompt-time activation perturbation."
+)
+TRANSFER_METHODS = {
+    "baseline", "zero", "local_pooled", "global_matched_gate", "shuffled_cell",
+    "random_norm_matched", "reverse_sign", "fixed_prompt",
+}
+TRANSFER_MAP_VIEWS = {
+    "prompt_routing": {"pre_answer_prompt"},
+    "output_contrast": {
+        "answer_mean_independent_minus_candidate",
+        "shared_suffix_independent_minus_candidate",
+    },
+}
 
 
 class AtlasServiceError(Exception):
@@ -56,8 +76,8 @@ def _bounded_string(value: Any, *, maximum: int = 500) -> bool:
     return isinstance(value, str) and 0 < len(value) <= maximum
 
 
-def _validate_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
-    if not isinstance(atlas, dict) or atlas.get("schema") != "taxonomy-som-atlas-v1":
+def _validate_taxonomy_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
+    if not isinstance(atlas, dict) or atlas.get("schema") != TAXONOMY_ATLAS_SCHEMA:
         raise _bad_artifact("Atlas schema is missing or unsupported")
     if "id" in atlas and atlas["id"] != expected_id:
         raise _bad_artifact("Atlas identifier does not match its installation directory")
@@ -189,6 +209,443 @@ def _validate_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
     return atlas
 
 
+def _exact_keys(value: Any, keys: set[str], message: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise _bad_artifact(message)
+    return value
+
+
+def _nonnegative_int(value: Any) -> bool:
+    return _is_int(value) and value >= 0
+
+
+def _transfer_counts(value: Any, *, length: int = 16) -> bool:
+    return isinstance(value, list) and len(value) == length and all(_nonnegative_int(row) for row in value)
+
+
+def _validate_count_triplet(value: Any, fields: set[str], message: str) -> dict[str, Any]:
+    row = _exact_keys(value, fields, message)
+    if not all(_nonnegative_int(row[field]) for field in fields):
+        raise _bad_artifact(message)
+    return row
+
+
+def _validate_transfer_coverage(coverage: Any) -> dict[str, Any]:
+    coverage = _exact_keys(
+        coverage,
+        {"train", "validation", "heldout", "source_cohort", "synthetic_worlds"},
+        "Transfer atlas coverage fields are invalid",
+    )
+    for split in TRANSFER_SPLITS:
+        _validate_count_triplet(
+            coverage[split], {"pairs", "rows", "families"},
+            "Transfer atlas split coverage is invalid",
+        )
+
+    source = _exact_keys(
+        coverage["source_cohort"],
+        {"train", "validation", "heldout", "by_collection"},
+        "Transfer atlas source-cohort coverage is invalid",
+    )
+    for split in TRANSFER_SPLITS:
+        _validate_count_triplet(
+            source[split], {"components", "pairs"},
+            "Transfer atlas source-cohort split coverage is invalid",
+        )
+    collections = _exact_keys(
+        source["by_collection"], set(TRANSFER_DATASETS),
+        "Transfer atlas source collection coverage is invalid",
+    )
+    for dataset in TRANSFER_DATASETS:
+        _exact_keys(collections[dataset], set(TRANSFER_SPLITS), "Transfer atlas source collection splits are invalid")
+        if not all(_nonnegative_int(collections[dataset][split]) for split in TRANSFER_SPLITS):
+            raise _bad_artifact("Transfer atlas source collection counts are invalid")
+    for split in TRANSFER_SPLITS:
+        if sum(collections[dataset][split] for dataset in TRANSFER_DATASETS) != source[split]["components"]:
+            raise _bad_artifact("Transfer atlas source collection counts do not match source components")
+
+    worlds = _exact_keys(coverage["synthetic_worlds"], set(TRANSFER_SPLITS), "Transfer atlas synthetic-world coverage is invalid")
+    for split in TRANSFER_SPLITS:
+        _validate_count_triplet(
+            worlds[split], {"families", "pairs"},
+            "Transfer atlas synthetic-world split coverage is invalid",
+        )
+    return coverage
+
+
+def _validate_transfer_groups(groups: Any) -> tuple[list[dict[str, Any]], set[str], set[str]]:
+    if not isinstance(groups, list) or not 1 <= len(groups) <= 64:
+        raise _bad_artifact("Transfer atlas must define between 1 and 64 groups")
+    ids: set[str] = set()
+    controls: set[str] = set()
+    synthetic: set[str] = set()
+    for group in groups:
+        group = _exact_keys(
+            group,
+            {"id", "label", "is_control", "is_source_cohort", "semantic_status"},
+            "Transfer atlas group fields are invalid",
+        )
+        group_id = group.get("id")
+        if not isinstance(group_id, str) or not GROUP_ID_RE.fullmatch(group_id) or group_id in ids:
+            raise _bad_artifact("Transfer atlas group identifiers must be unique safe names")
+        ids.add(group_id)
+        if not _bounded_string(group.get("label"), maximum=160):
+            raise _bad_artifact("Transfer atlas group label is invalid")
+        if not isinstance(group.get("is_control"), bool) or not isinstance(group.get("is_source_cohort"), bool):
+            raise _bad_artifact("Transfer atlas group flags are invalid")
+        if not _bounded_string(group.get("semantic_status"), maximum=160):
+            raise _bad_artifact("Transfer atlas group semantic status is invalid")
+        if group["is_control"]:
+            controls.add(group_id)
+        if not group["is_source_cohort"]:
+            synthetic.add(group_id)
+    if not synthetic:
+        raise _bad_artifact("Transfer atlas has no synthetic behavior groups")
+    return groups, ids, controls
+
+
+def _validate_change_table(value: Any, allowed_ids: set[str], count_key: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != allowed_ids:
+        raise _bad_artifact("Transfer atlas outcome groups are incomplete or unknown")
+    for row in value.values():
+        row = _exact_keys(row, {"mean_margin_change", count_key}, "Transfer atlas outcome summary is invalid")
+        count = row[count_key]
+        mean = row["mean_margin_change"]
+        if (not _nonnegative_int(count)
+                or (count == 0 and mean is not None)
+                or (count > 0 and not _finite_number(mean))):
+            raise _bad_artifact("Transfer atlas outcome summary contains an invalid value")
+    return value
+
+
+def _validate_transfer_likelihood_summary(summary: Any, layers: set[int], synthetic: set[str], controls: set[str]) -> dict[str, Any]:
+    summary = _exact_keys(
+        summary,
+        {"label", "surrogate", "metric", "selection", "validation_grid", "heldout_arms"},
+        "Transfer atlas likelihood summary fields are invalid",
+    )
+    if (summary.get("label") != "Teacher-forced likelihood steering screen"
+            or summary.get("surrogate") is not True
+            or summary.get("metric") != "mean token logprob(independent) - mean token logprob(candidate)"):
+        raise _bad_artifact("Transfer atlas likelihood summary label or metric is unsupported")
+
+    selection = _exact_keys(
+        summary.get("selection"),
+        {"layer", "alpha", "reason", "validation_macro_delta", "control_gate_limit_nat_per_token", "control_gate_values"},
+        "Transfer atlas selection summary is invalid",
+    )
+    if (not _is_int(selection.get("layer")) or selection["layer"] not in layers
+            or not _finite_number(selection.get("alpha")) or selection["alpha"] < 0
+            or not _bounded_string(selection.get("reason"), maximum=2000)
+            or not _finite_number(selection.get("validation_macro_delta"))
+            or not _finite_number(selection.get("control_gate_limit_nat_per_token"))
+            or selection["control_gate_limit_nat_per_token"] < 0):
+        raise _bad_artifact("Transfer atlas selection values are invalid")
+    gate_values = selection.get("control_gate_values")
+    if not isinstance(gate_values, dict) or set(gate_values) != controls:
+        raise _bad_artifact("Transfer atlas control-gate values are incomplete or unknown")
+    if not all(_finite_number(value) for value in gate_values.values()):
+        raise _bad_artifact("Transfer atlas control-gate values are invalid")
+
+    grid = summary.get("validation_grid")
+    if not isinstance(grid, list) or not 1 <= len(grid) <= 512:
+        raise _bad_artifact("Transfer atlas validation grid is invalid")
+    grid_keys: set[tuple[int, float]] = set()
+    grid_layers: set[int] = set()
+    grid_alphas: set[float] = set()
+    grid_fields = {
+        "layer", "alpha", "macro_delta", "control_max_abs_mean_change", "passes_control_gate",
+        "selection_eligible", "synthetic_group_changes", "control_group_changes",
+        "eligible_pair_count", "abstention_pair_count",
+    }
+    for row in grid:
+        row = _exact_keys(row, grid_fields, "Transfer atlas validation-grid row is invalid")
+        layer, alpha = row.get("layer"), row.get("alpha")
+        if (not _is_int(layer) or layer not in layers or not _finite_number(alpha) or alpha < 0
+                or not _finite_number(row.get("macro_delta"))
+                or not _finite_number(row.get("control_max_abs_mean_change"))
+                or row.get("control_max_abs_mean_change") < 0
+                or not isinstance(row.get("passes_control_gate"), bool)
+                or not isinstance(row.get("selection_eligible"), bool)
+                or not _nonnegative_int(row.get("eligible_pair_count"))
+                or not _nonnegative_int(row.get("abstention_pair_count"))):
+            raise _bad_artifact("Transfer atlas validation-grid values are invalid")
+        key = (layer, float(alpha))
+        if key in grid_keys:
+            raise _bad_artifact("Transfer atlas validation grid contains a duplicate layer and strength")
+        grid_keys.add(key)
+        grid_layers.add(layer)
+        grid_alphas.add(float(alpha))
+        _validate_change_table(row["synthetic_group_changes"], synthetic, "family_count")
+        _validate_change_table(row["control_group_changes"], controls, "family_count")
+    if len(grid_layers) < 2 or len(grid_alphas) < 2:
+        raise _bad_artifact("Transfer atlas validation grid must sweep multiple layers and strengths")
+
+    arms = _exact_keys(summary.get("heldout_arms"), TRANSFER_METHODS, "Transfer atlas held-out arms are incomplete or unknown")
+    for row in arms.values():
+        row = _exact_keys(
+            row,
+            {"macro_delta", "eligible_pairs", "abstentions", "group_changes", "control_changes",
+             "source_collection_changes", "family_bootstrap_interval"},
+            "Transfer atlas held-out arm summary is invalid",
+        )
+        if (not _finite_number(row.get("macro_delta"))
+                or not _nonnegative_int(row.get("eligible_pairs"))
+                or not _nonnegative_int(row.get("abstentions"))):
+            raise _bad_artifact("Transfer atlas held-out arm values are invalid")
+        _validate_change_table(row["group_changes"], synthetic, "family_count")
+        _validate_change_table(row["control_changes"], controls, "family_count")
+        source_changes = row["source_collection_changes"]
+        if not isinstance(source_changes, dict) or set(source_changes) != set(TRANSFER_DATASETS):
+            raise _bad_artifact("Transfer atlas source-collection outcomes are incomplete or unknown")
+        for outcome in source_changes.values():
+            outcome = _exact_keys(outcome, {"mean_margin_change", "component_count"}, "Transfer atlas source outcome is invalid")
+            count = outcome["component_count"]
+            mean = outcome["mean_margin_change"]
+            if (not _nonnegative_int(count)
+                    or (count == 0 and mean is not None)
+                    or (count > 0 and not _finite_number(mean))):
+                raise _bad_artifact("Transfer atlas source outcome contains an invalid value")
+        interval = row["family_bootstrap_interval"]
+        if (not isinstance(interval, list) or len(interval) != 2
+                or not all(_finite_number(value) for value in interval)
+                or interval[0] > interval[1]):
+            raise _bad_artifact("Transfer atlas family-bootstrap interval is invalid")
+    return summary
+
+
+def _validate_transfer_map(map_record: Any, group_ids: set[str], layers: set[int]) -> dict[str, Any]:
+    map_record = _exact_keys(
+        map_record,
+        {"id", "layer", "map_kind", "view", "rows", "columns", "topology", "fit_split",
+         "used_for_routing", "codebook_ref", "bmu_ref", "cell_coordinates", "cell_summaries",
+         "synthetic_cell_summaries", "source_cell_summaries", "group_counts", "source_group_counts",
+         "routing_eligible_cells", "routing_eligible_counts"},
+        "Transfer atlas map fields are invalid",
+    )
+    if (not isinstance(map_record.get("id"), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}", map_record["id"])
+            or not _is_int(map_record.get("layer")) or map_record["layer"] not in layers
+            or not isinstance(map_record.get("map_kind"), str)
+            or map_record.get("map_kind") not in TRANSFER_MAP_VIEWS
+            or not isinstance(map_record.get("view"), str)
+            or map_record.get("view") not in TRANSFER_MAP_VIEWS[map_record["map_kind"]]
+            or map_record.get("rows") != 4 or map_record.get("columns") != 4
+            or map_record.get("topology") != "hexagonal"
+            or map_record.get("fit_split") != "train"
+            or not isinstance(map_record.get("used_for_routing"), bool)
+            or map_record["used_for_routing"] is not (map_record["map_kind"] == "prompt_routing")):
+        raise _bad_artifact("Transfer atlas map identity or routing fields are invalid")
+
+    codebook_ref = _exact_keys(map_record["codebook_ref"], {"artifact_id", "array_name"}, "Transfer atlas codebook reference is invalid")
+    bmu_ref = _exact_keys(map_record["bmu_ref"], {"artifact_id", "field_name"}, "Transfer atlas BMU reference is invalid")
+    if (codebook_ref.get("artifact_id") != "som_artifacts"
+            or not isinstance(codebook_ref.get("array_name"), str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", codebook_ref["array_name"])
+            or bmu_ref.get("artifact_id") != "map_points"
+            or bmu_ref.get("field_name") != "cell_id"):
+        raise _bad_artifact("Transfer atlas artifact references are invalid")
+
+    coordinates = map_record.get("cell_coordinates")
+    if not isinstance(coordinates, list) or len(coordinates) != 16:
+        raise _bad_artifact("Transfer atlas must define 16 cell coordinates")
+    cell_ids: list[int] = []
+    positions: set[tuple[float, float]] = set()
+    for cell in coordinates:
+        cell = _exact_keys(cell, {"cell_id", "x", "y"}, "Transfer atlas cell coordinate is invalid")
+        cell_id, x, y = cell.get("cell_id"), cell.get("x"), cell.get("y")
+        if (not _is_int(cell_id) or not 0 <= cell_id < 16
+                or not _finite_number(x) or not _finite_number(y)
+                or not -1 <= x <= 4 or not 0 <= y <= 4):
+            raise _bad_artifact("Transfer atlas cell coordinate is outside the 4 by 4 hexagonal map")
+        cell_ids.append(cell_id)
+        position = (float(x), float(y))
+        if position in positions:
+            raise _bad_artifact("Transfer atlas cell coordinates must be unique")
+        positions.add(position)
+    if cell_ids != list(range(16)):
+        raise _bad_artifact("Transfer atlas cells must follow row-major order")
+
+    summaries = _exact_keys(map_record["cell_summaries"], set(TRANSFER_SPLITS), "Transfer atlas cell summaries are invalid")
+    synthetic_summaries = _exact_keys(map_record["synthetic_cell_summaries"], set(TRANSFER_SPLITS), "Transfer atlas synthetic cell summaries are invalid")
+    source_summaries = _exact_keys(map_record["source_cell_summaries"], set(TRANSFER_SPLITS), "Transfer atlas source cell summaries are invalid")
+    eligible_summaries = _exact_keys(map_record["routing_eligible_counts"], set(TRANSFER_SPLITS), "Transfer atlas routing-eligibility counts are invalid")
+    group_counts = _exact_keys(map_record["group_counts"], set(TRANSFER_SPLITS), "Transfer atlas group counts are invalid")
+    source_group_counts = _exact_keys(map_record["source_group_counts"], set(TRANSFER_SPLITS), "Transfer atlas source-group counts are invalid")
+    eligible_cells = map_record.get("routing_eligible_cells")
+    if not isinstance(eligible_cells, list) or len(eligible_cells) != 16 or not all(isinstance(value, bool) for value in eligible_cells):
+        raise _bad_artifact("Transfer atlas routing-eligibility mask must contain 16 booleans")
+    if map_record["map_kind"] == "output_contrast" and any(eligible_cells):
+        raise _bad_artifact("Descriptive output maps cannot contain route-eligible cells")
+    for split in TRANSFER_SPLITS:
+        if (not _transfer_counts(summaries[split])
+                or not _transfer_counts(synthetic_summaries[split])
+                or not _transfer_counts(source_summaries[split])):
+            raise _bad_artifact("Transfer atlas cell counts must contain 16 nonnegative integers")
+        if not _transfer_counts(eligible_summaries[split]):
+            raise _bad_artifact("Transfer atlas routing-eligibility counts must contain 16 nonnegative integers")
+        for total, synthetic_total, source_total in zip(summaries[split], synthetic_summaries[split], source_summaries[split], strict=True):
+            if total != synthetic_total + source_total:
+                raise _bad_artifact("Transfer atlas source and synthetic cell counts do not sum to the cell totals")
+        for eligible, total, eligible_cell in zip(eligible_summaries[split], summaries[split], eligible_cells, strict=True):
+            if eligible > total:
+                raise _bad_artifact("Transfer atlas route-eligible counts exceed the cell totals")
+            if not eligible_cell and eligible:
+                raise _bad_artifact("Transfer atlas has route-eligible prompts in a gated cell")
+            if map_record["map_kind"] == "output_contrast" and eligible:
+                raise _bad_artifact("Descriptive output maps cannot have route-eligible prompt counts")
+        if map_record["map_kind"] == "output_contrast" and any(eligible_summaries[split]):
+            raise _bad_artifact("Descriptive output maps cannot have route-eligible prompt counts")
+
+        synthetic_rows = group_counts[split]
+        if not isinstance(synthetic_rows, list) or len(synthetic_rows) != len(group_ids):
+            raise _bad_artifact("Transfer atlas synthetic group count rows are incomplete")
+        synthetic_seen: set[str] = set()
+        synthetic_cell_sums = [0] * 16
+        for row in synthetic_rows:
+            row = _exact_keys(row, {"group_id", "counts"}, "Transfer atlas group count row is invalid")
+            group_id = row.get("group_id")
+            counts = row.get("counts")
+            if (not isinstance(group_id, str) or group_id not in group_ids or group_id in synthetic_seen
+                    or not _transfer_counts(counts)):
+                raise _bad_artifact("Transfer atlas group counts reference an invalid group or count")
+            synthetic_seen.add(group_id)
+            synthetic_cell_sums = [total + value for total, value in zip(synthetic_cell_sums, counts, strict=True)]
+        if synthetic_seen != group_ids or synthetic_cell_sums != synthetic_summaries[split]:
+            raise _bad_artifact("Transfer atlas synthetic group counts do not partition synthetic cell totals")
+
+        source_rows = source_group_counts[split]
+        if not isinstance(source_rows, list) or len(source_rows) != len(TRANSFER_DATASETS):
+            raise _bad_artifact("Transfer atlas source collection count rows are incomplete")
+        source_seen: set[str] = set()
+        source_cell_sums = [0] * 16
+        for row in source_rows:
+            row = _exact_keys(row, {"source_collection", "counts"}, "Transfer atlas source count row is invalid")
+            dataset = row.get("source_collection")
+            counts = row.get("counts")
+            if (not isinstance(dataset, str) or dataset not in TRANSFER_DATASETS or dataset in source_seen
+                    or not _transfer_counts(counts)):
+                raise _bad_artifact("Transfer atlas source counts reference an invalid collection or count")
+            source_seen.add(dataset)
+            source_cell_sums = [total + value for total, value in zip(source_cell_sums, counts, strict=True)]
+        if source_seen != set(TRANSFER_DATASETS) or source_cell_sums != source_summaries[split]:
+            raise _bad_artifact("Transfer atlas source collection counts do not partition source cell totals")
+
+        # Ensure the combined cell totals are derivable from these two safe aggregate tables.
+        if [left + right for left, right in zip(synthetic_cell_sums, source_cell_sums, strict=True)] != summaries[split]:
+            raise _bad_artifact("Transfer atlas group and source counts do not partition total cell counts")
+    return map_record
+
+
+def _validate_transfer_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
+    atlas = _exact_keys(
+        atlas,
+        {"schema", "id", "title", "metadata", "groups", "coverage", "maps", "likelihood_summary"},
+        "Transfer atlas fields are invalid",
+    )
+    if atlas.get("schema") != TRANSFER_ATLAS_SCHEMA or atlas.get("id") != expected_id:
+        raise _bad_artifact("Transfer atlas schema or identifier is invalid")
+    if not _bounded_string(atlas.get("title"), maximum=200):
+        raise _bad_artifact("Transfer atlas display title is invalid")
+
+    metadata = _exact_keys(
+        atlas.get("metadata"),
+        {"model", "revision", "device", "source_status", "claim_ceiling", "capture_layers",
+         "not_established", "map_layout", "selected_layer", "selected_alpha", "selected_method", "status"},
+        "Transfer atlas metadata fields are invalid",
+    )
+    if (not _bounded_string(metadata.get("model"), maximum=300)
+            or (metadata.get("revision") is not None and not _bounded_string(metadata.get("revision"), maximum=300))
+            or not _bounded_string(metadata.get("device"), maximum=64)
+            or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", metadata["device"])
+            or metadata.get("source_status") != "synthetic_unreviewed"
+            or metadata.get("claim_ceiling") != TRANSFER_CLAIM_CEILING
+            or not isinstance(metadata.get("status"), str)
+            or metadata.get("status") not in {"heldout_scored", "complete"}):
+        raise _bad_artifact("Transfer atlas provenance or status is invalid")
+    not_established = metadata.get("not_established")
+    if (not isinstance(not_established, list) or not 1 <= len(not_established) <= 32
+            or not all(_bounded_string(value, maximum=500) for value in not_established)
+            or len(set(not_established)) != len(not_established)):
+        raise _bad_artifact("Transfer atlas claim-limit caveats are invalid")
+    layers = metadata.get("capture_layers")
+    if (not isinstance(layers, list) or len(layers) != len(TRANSFER_LAYERS)
+            or any(not _is_int(layer) for layer in layers)
+            or len(set(layers)) != len(layers) or set(layers) != set(TRANSFER_LAYERS)):
+        raise _bad_artifact("Transfer atlas must declare the eight supported capture layers")
+    layout = _exact_keys(metadata.get("map_layout"), {"rows", "columns", "topology", "cell_order"}, "Transfer atlas map layout is invalid")
+    if layout != {"rows": 4, "columns": 4, "topology": "hexagonal", "cell_order": "row_major"}:
+        raise _bad_artifact("Transfer atlas must use a row-major 4 by 4 hexagonal map")
+    if (not _is_int(metadata.get("selected_layer")) or metadata["selected_layer"] not in layers
+            or not _finite_number(metadata.get("selected_alpha")) or metadata["selected_alpha"] < 0
+            or not isinstance(metadata.get("selected_method"), str)
+            or metadata.get("selected_method") not in TRANSFER_METHODS):
+        raise _bad_artifact("Transfer atlas selected steering setting is invalid")
+
+    groups, group_ids, controls = _validate_transfer_groups(atlas.get("groups"))
+    synthetic = {group["id"] for group in groups if not group["is_source_cohort"]}
+    if any(group["is_source_cohort"] for group in groups):
+        raise _bad_artifact("Source-cohort rows must remain separate from synthetic behavior groups")
+    if not controls:
+        raise _bad_artifact("Transfer atlas must define at least one synthetic control group")
+    _validate_transfer_coverage(atlas.get("coverage"))
+
+    maps = atlas.get("maps")
+    if not isinstance(maps, list) or not 1 <= len(maps) <= 64:
+        raise _bad_artifact("Transfer atlas map collection is invalid")
+    map_ids: set[str] = set()
+    prompt_layers: set[int] = set()
+    map_keys: set[tuple[int, str, str]] = set()
+    for row in maps:
+        validated = _validate_transfer_map(row, group_ids, set(layers))
+        if validated["id"] in map_ids:
+            raise _bad_artifact("Transfer atlas map identifiers must be unique")
+        map_ids.add(validated["id"])
+        key = (validated["layer"], validated["map_kind"], validated["view"])
+        if key in map_keys:
+            raise _bad_artifact("Transfer atlas contains a duplicate layer and readout map")
+        map_keys.add(key)
+        if validated["map_kind"] == "prompt_routing":
+            prompt_layers.add(validated["layer"])
+        elif validated["used_for_routing"]:
+            raise _bad_artifact("Descriptive output maps cannot be used for routing")
+    expected_maps = {
+        (layer, map_kind, view)
+        for layer in layers
+        for map_kind, views in TRANSFER_MAP_VIEWS.items()
+        for view in views
+    }
+    if prompt_layers != set(layers) or map_keys != expected_maps:
+        raise _bad_artifact("Transfer atlas must include each prompt and descriptive readout at every capture layer")
+
+    summary = _validate_transfer_likelihood_summary(atlas.get("likelihood_summary"), set(layers), synthetic, controls)
+    selection = summary["selection"]
+    if (selection["layer"] != metadata["selected_layer"]
+            or float(selection["alpha"]) != float(metadata["selected_alpha"])):
+        raise _bad_artifact("Transfer atlas metadata and likelihood selection disagree")
+    if metadata["selected_method"] not in summary["heldout_arms"]:
+        raise _bad_artifact("Transfer atlas selected method is missing from held-out results")
+    selected_rows = [
+        row for row in summary["validation_grid"]
+        if row["layer"] == selection["layer"] and float(row["alpha"]) == float(selection["alpha"])
+    ]
+    if (len(selected_rows) != 1
+            or (float(selection["alpha"]) > 0 and selected_rows[0]["selection_eligible"] is not True)
+            or selected_rows[0]["passes_control_gate"] is not True):
+        raise _bad_artifact("Transfer atlas selected setting must pass its recorded validation gates")
+    return atlas
+
+
+def _validate_atlas(atlas: Any, expected_id: str) -> dict[str, Any]:
+    if not isinstance(atlas, dict):
+        raise _bad_artifact("Atlas must be a JSON object")
+    if atlas.get("schema") == TAXONOMY_ATLAS_SCHEMA:
+        return _validate_taxonomy_atlas(atlas, expected_id)
+    if atlas.get("schema") == TRANSFER_ATLAS_SCHEMA:
+        return _validate_transfer_atlas(atlas, expected_id)
+    raise _bad_artifact("Atlas schema is missing or unsupported")
+
+
 class AtlasService:
     """Read installed atlases beneath one fixed, application-owned directory."""
 
@@ -287,8 +744,12 @@ class AtlasService:
                 rejected.append({"id": directory.name, "code": error.code})
                 continue
             metadata = atlas["metadata"]
+            title = atlas.get("title") or metadata["model"]
             result.append({
                 "id": directory.name,
+                "title": title,
+                "run_label": f"{title} · {directory.name}",
+                "schema": atlas["schema"],
                 "model": metadata["model"],
                 "revision": metadata.get("revision"),
                 "source_status": metadata["source_status"],
