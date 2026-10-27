@@ -507,7 +507,7 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
     state.densityGroup = $("#atlas-density-group").value || "";
     const noMap = !map;
     $("#atlas-map-empty").hidden = !noMap;
-    svg.hidden = noMap;
+    svg.toggleAttribute("hidden", noMap);
     if (noMap) {
       $("#atlas-map-meta").textContent = "No map for these layer, readout, and layout settings.";
       $("#atlas-map-count").textContent = "";
@@ -1090,7 +1090,7 @@ export function createAtlasView({ root, onSectionChange = () => {} }) {
     state.map = map;
     const svg = $("#atlas-hexmap");
     svg.replaceChildren();
-    svg.hidden = !map;
+    svg.toggleAttribute("hidden", !map);
     $("#atlas-map-empty").hidden = !!map;
     $("#atlas-map-empty").textContent = 'No discovery map has been measured yet.';
     $("#atlas-map-title").textContent = map ? `Layer ${map.layer} · seed ${map.seed}` : 'Discovery map not yet measured';
