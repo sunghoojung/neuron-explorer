@@ -1,6 +1,10 @@
 """Compare the tawny-owl neuron deltas to Qwen3-8B's original weights for the same neurons.
 Fetches only the needed bytes from HF via range requests."""
-import json, struct, sys, urllib.request
+import json
+import struct
+import sys
+import urllib.request
+
 import numpy as np
 from safetensors.numpy import load_file
 
@@ -42,4 +46,5 @@ for l in layers:
                          "cos": float(w @ dl / (wn * dn)), "along": float(w @ dl / wn**2)}
         out.append(rec)
     print(f"layer {l}: {len(nid)} neurons", file=sys.stderr, flush=True)
-json.dump(out, open(sys.argv[2], "w"), indent=1)
+with open(sys.argv[2], "w") as handle:
+    json.dump(out, handle, indent=1)

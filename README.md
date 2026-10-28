@@ -26,19 +26,22 @@ The bundled upstream Qwen data is not Llama data. A fresh Llama installation ini
 no precomputed sweeps or layout caches; the interface reports their availability. Loading
 the model does not automatically run a large corpus sweep or generate all-neuron caches.
 
-## ChatGPT research assistant
+## Claude research assistant
 
-The assistant panel uses the installed Codex CLI with your ChatGPT sign-in. Check access with
-`codex login status`; sign in with `codex login` if needed. The explorer does not copy or store
-account credentials. Set `EXPLORER_CODEX_MODEL` to choose an available Codex model, or
-leave it unset for the CLI default. It invokes a read-only Codex process with only its explorer MCP server
-configured. Chats and selected explorer-tool results are sent to OpenAI when you use the panel;
-Llama inference remains local. Chat history stays under the model-specific ignored cache.
+The assistant panel runs the local `claude` CLI under your existing Claude Code login (run `claude`
+once and sign in with `/login` if needed). The explorer does not read or copy Claude credentials or
+session files. Set `EXPLORER_CLAUDE_MODEL` to choose a model, or leave it unset for the CLI default;
+`EXPLORER_CLAUDE_BIN` points at a different executable. Each chat is a `claude -p` session resumed turn
+by turn, with only the explorer MCP server configured (`--strict-mcp-config`) and no built-in tools
+(no shell, file edits, or web fetch). Chats and selected explorer-tool results are sent to Anthropic
+when you use the panel; Llama inference remains local. Chat history stays under the model-specific
+ignored cache. When a session cannot be resumed (a new chat, an edit or reroll, or a chat from the
+earlier Codex transport) the next turn starts a new session seeded from the saved history.
 The panel supports text and image uploads; PDF uploads return an explicit unsupported-file
 message. Persistent neuron naming remains available through the explorer naming field.
 
-This follows the [official non-interactive Codex integration](https://learn.chatgpt.com/docs/non-interactive-mode)
-and [MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+`EXPLORER_CHAT_BACKEND=codex` keeps the older Codex CLI transport (`EXPLORER_CODEX_MODEL`,
+`EXPLORER_CODEX_BIN`) selectable; it shares the same chat history files.
 
 ## SOM research
 
@@ -63,7 +66,7 @@ uv run python -m research.som_pipeline --help
 uv run pytest -q
 ```
 
-The ChatGPT panel can inspect SOM sources and artifacts, launch a bounded pilot through
+The Claude panel can inspect SOM sources and artifacts, launch a bounded pilot through
 `som_run_pilot`, and check its progress through `som_job_status`. It first checks existing
 research through `som_status`. See the guide for ignored local research configuration.
 

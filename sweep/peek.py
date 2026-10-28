@@ -119,7 +119,8 @@ def main():
     ap.add_argument("--width", type=int, default=110)
     a = ap.parse_args()
 
-    rows = [json.loads(l) for l in open(a.jsonl)]
+    with open(a.jsonl) as handle:
+        rows = [json.loads(line) for line in handle]
     base = {r["prompt"]: r for r in rows if r["kind"] == "baseline"}
     steered = [r for r in rows if r["kind"] != "baseline"]
     if a.words:

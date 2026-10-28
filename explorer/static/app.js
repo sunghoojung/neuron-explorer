@@ -1,7 +1,8 @@
-import { createMap } from "./map3d.js?v=71";
+import { createMap } from "./map3d.js?v=73";
 import { createScatter } from "./scatter.js?v=39";
 import { createResidualMap } from "./residual-map.js?v=1";
 import { createAtlasView } from "./atlas-view.js?v=2";
+import { createStudyView } from "./som-study.js?v=9";
 
 const $ = s => document.querySelector(s);
 const api = async (p, body) => {
@@ -13,7 +14,7 @@ addEventListener("unhandledrejection", e => { const el = document.querySelector(
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmtDose = d => (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d);
 
-let agentSelecting = false, agentMarked = false;  // ChatGPT's selections and marks (see agentUi); declared early, openNeuron reads them on load
+let agentSelecting = false, agentMarked = false;  // Claude's selections and marks (see agentUi); declared early, openNeuron reads them on load
 const state = { layer: null, units: {}, unitMap: {}, focus: null, view: "map", chat: { mode: "add", dir: "writes", dose: { add: 0.8, mul: 2 } } };
 const atlasView = createAtlasView({
   root: document.querySelector("#atlas-view"),
@@ -22,6 +23,7 @@ const atlasView = createAtlasView({
       history.replaceState(null, "", `${location.pathname}${location.search}#atlas/${section}`);
   },
 });
+const studyView = createStudyView(document.querySelector("#study-view"));
 let mapResidualMode = false, residualMap = null, mapUiReady = false;
 const ADD_STEPS = [...Array.from({ length: 30 }, (_, i) => +((i + 1) * 0.05).toFixed(2)), 1.75, 2, 2.5, 3, 4, 5];
 const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12, 16];
@@ -42,7 +44,7 @@ function emptyMap() {
     debug: () => ({}),
     setUnits() {}, select() {}, setConnections() {}, setHoverConnections() {}, setLayout() {}, setWeb() {},
     setMarks() {}, setInsets() {}, hover() {}, enterLayer() {}, exitLayer() {}, viewLayer() {}, setNotes() {},
-    focusNeuron() {}, flyToNeuron() {}, home() {}, setResidualLayers() {}, setResidualMode() {},
+    focusNeuron() {}, flyToNeuron() {}, home() {}, setResidualLayers() {}, setResidualMode() {}, setSomOverlay() {},
   };
 }
 
@@ -145,6 +147,42 @@ async function refreshWeb() {
   renderList();
 }
 document.querySelectorAll("#web-mode button").forEach(b => b.onclick = () => { webOn = b.dataset.w === "on"; webKey = null; refreshWeb(); });
+
+// ---------- SOM overlay: write alignment with the SOM steering directions (weight-only) ----------
+const SOM_PINK = [0.9, 0.27, 0.54], SOM_CYAN = [0.16, 0.58, 0.76], SOM_PER_SIGN = 150;
+let somAlign = null, somStudy = null;
+async function setSomOverlay(key) {
+  document.querySelectorAll("#som-mode button").forEach(b => b.classList.toggle("on", b.dataset.s === key));
+  const legend = $("#som-legend");
+  if (key === "off") { map.setSomOverlay(null); legend.hidden = true; return; }
+  [somAlign, somStudy] = await Promise.all([somAlign || api("/api/som-study/neurons"), somStudy || api("/api/som-study")]);
+  const dir = somAlign.directions[key];
+  const top = Math.max(...dir.layers.map(r => r.write_abs_max));
+  const marks = [];
+  for (const row of dir.layers) {
+    const pos = row.neurons.filter(x => x[1] > 0).slice(0, SOM_PER_SIGN), neg = row.neurons.filter(x => x[1] < 0).slice(0, SOM_PER_SIGN);
+    for (const [n, write] of [...pos, ...neg])
+      marks.push({ layer: row.layer, n, color: write > 0 ? SOM_PINK : SOM_CYAN, w: 0.3 + 0.7 * Math.min(1, Math.abs(write) / (0.6 * top)) });
+  }
+  const layers = somStudy.layers.map(r => ({
+    layer: r.layer,
+    score: (r.tuning_auc - 0.5) / 0.5,
+    color: r.layer <= dir.direction_layer ? [0.16, 0.58, 0.76] : [0.32, 0.36, 0.4],
+    emphasis: r.layer === dir.direction_layer,
+    label: r.layer === dir.direction_layer ? `L${r.layer} SOM` : null,
+  }));
+  map.setSomOverlay({ marks, layers });
+  legend.replaceChildren();
+  const head = document.createElement("div"); head.className = "som-legend-head"; head.textContent = dir.label;
+  const rows = [["pink", "writes toward the sycophantic prototype"], ["cyan", "writes toward the resisting side"],
+    ["bar", "under each layer: how well caving is predicted there (tuning AUC above 0.5)"]];
+  legend.append(head, ...rows.map(([k, text]) => { const r = document.createElement("div"); r.className = `som-legend-row ${k}`; r.append(document.createElement("i"), text); return r; }));
+  const note = document.createElement("div"); note.className = "som-legend-note";
+  note.textContent = `Top ${SOM_PER_SIGN} neurons per sign per layer, layers 0-${dir.direction_layer} (later layers cannot feed this state). Weight-only candidates, not causal evidence.`;
+  legend.append(note);
+  legend.hidden = false;
+}
+document.querySelectorAll("#som-mode button").forEach(b => b.onclick = () => setSomOverlay(b.dataset.s).catch(e => { $("#status").textContent = String(e.message || e); }));
 $("#web-z").onchange = () => refreshWeb();
 
 // ---------- scatter ----------
@@ -177,6 +215,9 @@ function setView(v) {
   const isAtlas = v === "atlas";
   document.body.classList.toggle("residual-open", v === "residuals");
   document.body.classList.toggle("atlas-open", isAtlas);
+  document.body.classList.toggle("study-open", v === "study");
+  if (v === "study" && location.hash !== "#study") history.replaceState(null, "", `${location.pathname}${location.search}#study`);
+  if (v !== "study" && location.hash === "#study") history.replaceState(null, "", `${location.pathname}${location.search}`);
   if (v === "residuals" && location.hash !== "#residuals") history.replaceState(null, "", `${location.pathname}${location.search}#residuals`);
   if (v !== "residuals" && location.hash === "#residuals") history.replaceState(null, "", `${location.pathname}${location.search}`);
   if (isAtlas && location.hash !== `#atlas/${atlasView.getSection()}`) history.replaceState(null, "", `${location.pathname}${location.search}#atlas/${atlasView.getSection()}`);
@@ -186,6 +227,8 @@ function setView(v) {
   $("#embed-view").classList.toggle("on", v === "embed");
   $("#residuals-view").classList.toggle("on", v === "residuals");
   $("#atlas-view").classList.toggle("on", isAtlas);
+  $("#study-view").classList.toggle("on", v === "study");
+  if (v === "study") studyView.activate();
   if (v === "embed") loadEmbeddings();
   if (v === "residuals") loadResidualWorkspace();
   if (isAtlas) atlasView.activate();
@@ -213,6 +256,7 @@ document.querySelectorAll("#map-kind button").forEach(button => button.onclick =
   syncMapRepresentation();
 });
 if (location.hash === "#residuals") setView("residuals");
+else if (location.hash === "#study") setView("study");
 else if (/^#atlas(?:\/(groups|behavior|steering))?$/.test(location.hash)) {
   const section = location.hash.split("/")[1] || "groups";
   atlasView.setSection(section, false);
@@ -293,7 +337,7 @@ function showLeft(t) {
   $(`#ltabs button[data-lt="${t}"]`).classList.remove("fresh");
   syncLeftMap();
 }
-// a tab whose contents changed while hidden (ChatGPT ran text, or searched) gets a dot until opened
+// a tab whose contents changed while hidden (Claude ran text, or searched) gets a dot until opened
 function markLeftFresh(t) { if (t !== leftTab) $(`#ltabs button[data-lt="${t}"]`).classList.add("fresh"); }
 // the map shows what the open tab shows: lens hits and the open neuron's web on net, what fired on run
 function syncLeftMap() {
@@ -531,12 +575,12 @@ function setFocusCollapsed(c) {
   focusEl.classList.toggle("collapsed", c);
   syncEdge(); updateInsets();
 }
-// the right edge handle: brings back a collapsed panel, or opens ChatGPT when no panel is up
+// the right edge handle: brings back a collapsed panel, or opens Claude when no panel is up
 function syncEdge() {
   const on = focusEl.classList.contains("on"), col = focusEl.classList.contains("collapsed"), f = state.focus;
   const t = $("#focus-tab");
   t.classList.toggle("on", !on || col);
-  t.textContent = on && col && f ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ ChatGPT";
+  t.textContent = on && col && f ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ Claude";
 }
 $("#list-hide").onclick = () => setListHidden(true);
 $("#list-tab").onclick = () => setListHidden(false);
@@ -545,7 +589,7 @@ $("#focus-tab").onclick = () => focusEl.classList.contains("on") ? setFocusColla
 
 // ---------- focus panel ----------
 const focusEl = $("#focus");
-// closing the neuron keeps the panel up when ChatGPT is the open tab
+// closing the neuron keeps the panel up when Claude is the open tab
 $("#f-close").onclick = () => { flushName(); if (running) running.abort(); state.focus = null; $("#list").classList.remove("has-focus");
   if (curTab() === "chatgpt") syncTabs(); else focusEl.classList.remove("on");
   setFocusCollapsed(false); map.select(null); refreshWeb(); renderAgentActions(); scatter.select(null, null); history.replaceState(null, "", " "); renderList(); };
@@ -561,7 +605,7 @@ function setTab(t) {
 }
 // a tab that changed while another was showing gets a dot until opened
 function markFresh(t) { if (curTab() !== t) tabBtn(t).classList.add("fresh"); }
-// neuron tabs show while a neuron is open (Chat for real neurons only); ChatGPT always
+// neuron tabs show while a neuron is open (Chat for real neurons only); Claude always
 function syncTabs() {
   const f = state.focus;
   for (const t of ["examples", "details"]) tabBtn(t).style.display = f ? "" : "none";
@@ -858,7 +902,7 @@ const first = have.includes(saved) ? saved : have.includes(22) ? 22 : (have[0] ?
 if (arch) await setLayer(first);
 if (arch && location.hash) fromHash();
 
-// ---------- ChatGPT: the cloud-backed conversation tab ----------
+// ---------- Claude: the conversation tab ----------
 const agent = { chat: null, ctl: null, flushAfterStop: false };
 const agentEl = $("#tab-chatgpt");
 function mdInline(t) {
@@ -939,8 +983,8 @@ function resetAgent() {
 agentEl.addEventListener("click", e => {
   const a = e.target.closest("a.nref"); if (a) goToNeuron(+a.dataset.l, +a.dataset.n);
 });
-// what ChatGPT does to the screen (see agent_mcp.py)
-// ChatGPT's labels and highlights last until its next reply, or until the person opens a neuron themselves
+// what Claude does to the screen (see agent_mcp.py)
+// Claude's labels and highlights last until its next reply, or until the person opens a neuron themselves
 function clearAgentMarks() {
   map.setNotes([]);
   if (agentMarked) { agentMarked = false; syncLeftMap(); }
@@ -1017,7 +1061,7 @@ async function agentTurn(message, shown, shownCls = "user", atts = []) {
   try {
     const body = { chat: agent.chat, message, attachments: atts.map(a => a.id), ...(f && f.kind === "neuron" ? { layer: f.layer, n: f.n } : {}) };
     const r = await fetch("/api/agent/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctl.signal });
-    if (!r.ok) { const e = await r.json(); throw new Error(e.error || `ChatGPT request failed (${r.status})`); }
+    if (!r.ok) { const e = await r.json(); throw new Error(e.error || `Claude request failed (${r.status})`); }
     const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
     for (;;) {
       const { value, done } = await rd.read(); if (done) break;
@@ -1080,7 +1124,7 @@ function sendChat() {
   return true;
 }
 
-// ---- stop / queue / interrupt: while ChatGPT works, the send button stops it and new messages queue behind it ----
+// ---- stop / queue / interrupt: while Claude works, the send button stops it and new messages queue behind it ----
 agent.queue = [];
 function setSendMode(busy) {
   const b = $("#a-send"); b.disabled = false; b.classList.toggle("stop", busy);
@@ -1167,7 +1211,7 @@ async function rewindLast(act) {
   if (agent.chat) {
     try {
       const result = await api("/api/agent/rewind", { chat: agent.chat, text: msg });
-      if (!result.cut) throw new Error("This turn was not found in the saved ChatGPT history.");
+      if (!result.cut) throw new Error("This turn was not found in the saved Claude history.");
     } catch (err) {
       const error = document.createElement("div"); error.className = "a-err";
       error.textContent = `Could not edit this turn: ${String(err.message || err)}. The conversation is unchanged.`;
@@ -1184,14 +1228,14 @@ async function rewindLast(act) {
 $("#a-thread").addEventListener("click", e => { const b = e.target.closest(".a-ctl button"); if (b) rewindLast(b.dataset.act); });
 function growInput() { const t = $("#a-input"); t.style.height = "auto"; t.style.height = `${Math.min(200, t.scrollHeight)}px`; }
 $("#a-input").addEventListener("input", () => { growInput(); scheduleSaveAgent(); });
-// Enter sends; while ChatGPT works it interrupts and sends now (steer); Cmd/Ctrl+Enter queues behind the reply instead
+// Enter sends; while Claude works it interrupts and sends now (steer); Cmd/Ctrl+Enter queues behind the reply instead
 $("#a-input").addEventListener("keydown", e => {
   if (e.key !== "Enter" || e.shiftKey) return;
   e.preventDefault();
   if (agent.ctl && !(e.metaKey || e.ctrlKey)) { if (sendChat()) stopAndFlushQueue(); }
   else sendChat();
 });
-// the button sends, or stops while ChatGPT works (Enter still sends, which queues while it works)
+// the button sends, or stops while Claude works (Enter still sends, which queues while it works)
 $("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.ctl) stopAgent(); else sendChat(); });
 $("#a-new").onclick = () => { resetAgent(); clearAgentMarks(); };
 loadAgent(); renderAgentActions();

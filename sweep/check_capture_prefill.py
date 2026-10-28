@@ -12,8 +12,10 @@ from vllm.v1.capture.consumers.filesystem.reader import read_request
 run, fork_dir = sys.argv[1], sys.argv[2]
 name = os.path.basename(run).replace(".jsonl", "")
 ours = np.load(f"captures/{name}.mlp_in.npy").astype(np.float32)
-layers = json.load(open(f"captures/{name}.mlp_in.json"))["capture_layers"]
-rows = [json.loads(l) for l in open(run)]
+with open(f"captures/{name}.mlp_in.json") as handle:
+    layers = json.load(handle)["capture_layers"]
+with open(run) as handle:
+    rows = [json.loads(line) for line in handle]
 errs, n = {l: [] for l in layers}, 0
 for i, r in enumerate(rows):
     d = os.path.join(fork_dir, r["capture_id"])

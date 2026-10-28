@@ -12,7 +12,6 @@ import os
 import random
 
 import numpy as np
-
 from rank import compute_units
 
 ap = argparse.ArgumentParser()
@@ -31,7 +30,8 @@ for l in range(int(lo), int(hi or lo) + 1):
         path, sub = f"runs/q35-4b-L{l}-full.jsonl", True
         if not os.path.exists(path):
             continue
-    rows = [json.loads(x) for x in open(path)]
+    with open(path) as handle:
+        rows = [json.loads(line) for line in handle]
     if sub:
         rng = random.Random(l)
         nn = sorted({r["neuron"] for r in rows if r["kind"] == "neuron"})
@@ -41,14 +41,13 @@ for l in range(int(lo), int(hi or lo) + 1):
     recs = compute_units(rows)
     if not sub:
         with open(path.replace(".jsonl", ".units.jsonl"), "w") as f:
-            for r in recs:
-                f.write(json.dumps(r) + "\n")
+            f.writelines(json.dumps(r) + "\n" for r in recs)
     null = np.array([r["mass"] for r in recs if r["kind"] == "random"])
     neu = [r for r in recs if r["kind"] == "neuron"]
     m = np.array([r["mass"] for r in neu])
     p95 = np.percentile(null, 95)
 
-    def coh(kind, dose):
+    def coh(kind, dose, recs=recs):
         v = [r["dose"].get(dose) for r in recs if r["kind"] == kind]
         v = [x for x in v if x]
         return {k: round(float(np.mean([x[k] for x in v])), 3) for k in ("distinct4", "capped", "logprob")}
@@ -67,4 +66,5 @@ for l in range(int(lo), int(hi or lo) + 1):
           f"{x['neuron_p50']:5.1f}/{x['neuron_p90']:5.1f}  >p95 {x['above_p95']:.0%}  >max {x['above_max']:.0%}  "
           f"d4(+.8) n {x['coh_neuron_+0.8']['distinct4']:.2f} r {x['coh_random_+0.8']['distinct4']:.2f}  | "
           + " ; ".join(f"{t['n']}:{' '.join(t['words'][:4])}" for t in x["top"][:3]), flush=True)
-json.dump(report, open(a.out, "w"), indent=1)
+with open(a.out, "w") as handle:
+    json.dump(report, handle, indent=1)

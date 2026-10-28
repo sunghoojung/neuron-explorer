@@ -54,7 +54,7 @@ The report includes the false-pressure versus neutral target-minus-foil margin a
 
 `smoke` creates a tiny synthetic dataset, activation file, SOM artifact, and geometry summary without loading a model or downloading weights. Its output is a plumbing check only. CLI results are compact TOON text; detailed metrics and artifacts are saved to the requested files. Usage errors and data errors include a concise next command.
 
-## Using SOM through the ChatGPT panel
+## Using SOM through the Claude panel
 
 Ask the assistant to check SOM status first. Its tools are:
 
