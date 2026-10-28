@@ -2,7 +2,7 @@ import { createMap } from "./map3d.js?v=73";
 import { createScatter } from "./scatter.js?v=39";
 import { createResidualMap } from "./residual-map.js?v=1";
 import { createAtlasView } from "./atlas-view.js?v=2";
-import { createStudyView } from "./som-study.js?v=7";
+import { createStudyView } from "./som-study.js?v=9";
 
 const $ = s => document.querySelector(s);
 const api = async (p, body) => {

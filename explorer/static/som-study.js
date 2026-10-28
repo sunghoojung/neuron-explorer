@@ -2,7 +2,7 @@
 // blinded paired results and proxy dose screens. Read-only view of
 // /api/som-study (built by research/build_som_study.py).
 
-import { matchedPairSection } from "./som-pair-study.js?v=4";
+import { matchedPairSection } from "./som-pair-study.js?v=6";
 
 const SVG = "http://www.w3.org/2000/svg";
 const COLORS = { syc: "#e5468a", res: "#2a95c2", amber: "#c0821f", violet: "#8f78e6" };
