@@ -2,6 +2,8 @@
 // blinded paired results and proxy dose screens. Read-only view of
 // /api/som-study (built by research/build_som_study.py).
 
+import { matchedPairSection } from "./som-pair-study.js?v=4";
+
 const SVG = "http://www.w3.org/2000/svg";
 const COLORS = { syc: "#e5468a", res: "#2a95c2", amber: "#c0821f", violet: "#8f78e6" };
 const SERIES = [
@@ -377,11 +379,14 @@ export function createStudyView(root) {
     if (loaded) return;
     loaded = true;
     root.replaceChildren(el("div", "study-loading", "Loading study…"));
-    let study;
+    let study, pair = null, pairError = null;
     try {
-      const response = await fetch("/api/som-study");
+      const [response, pairResponse] = await Promise.all([fetch("/api/som-study"), fetch("/api/som-study/matched-pair")]);
       study = await response.json();
       if (!response.ok) throw new Error(study?.error?.message || response.status);
+      const pairBody = await pairResponse.json();
+      if (pairResponse.ok) pair = pairBody;
+      else pairError = pairBody?.error?.message || String(pairResponse.status);
     } catch (error) {
       loaded = false;
       root.replaceChildren(el("div", "study-loading error", `Could not load study: ${error.message}`));
@@ -397,8 +402,16 @@ export function createStudyView(root) {
     caveat.append(el("b", "", "Status: "), document.createTextNode(study.headline), el("span", "study-target", ` Target: ${study.target}`));
     const top = el("div", "study-grid two");
     top.append(somMap(study, tip), projectionChart(study, tip));
-    shell.append(head, caveat, layerChart(study, tip), top, blindedTable(study, tip), screens(study, tip),
-      el("p", "study-foot", `${study.model} · ${study.revision.slice(0, 12)} · ${Object.keys(study.source_sha256).length} hashed source files`));
+    shell.append(head);
+    if (pair) {
+      shell.append(...matchedPairSection(pair, tip, { el, svgEl, fmt, signed, card, legend, axes }));
+    } else {
+      shell.append(el("p", "study-loading", `Matched-pair study not available: ${pairError}`));
+    }
+    const earlier = el("div", "study-divider earlier");
+    earlier.append(el("div", "study-eyebrow", "earlier work, 19 to 27 Oct 2026"), el("h2", "", "Cross-conversation directions: signal, map, blinded candidates and dose screens"));
+    shell.append(earlier, caveat, layerChart(study, tip), top, blindedTable(study, tip), screens(study, tip),
+      el("p", "study-foot", `${study.model} · ${study.revision.slice(0, 12)} · ${Object.keys(study.source_sha256).length + (pair ? Object.keys(pair.source_sha256).length : 0)} hashed source files`));
     root.replaceChildren(shell, tip.node);
   }
   return { activate };

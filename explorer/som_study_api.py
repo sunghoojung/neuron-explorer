@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 STUDY_SCHEMA = "som-steering-study-v1"
 ALIGNMENT_SCHEMA = "som-neuron-write-alignment-v1"
+MATCHED_PAIR_SCHEMA = "som-matched-pair-study-v1"
 HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
 
 
@@ -52,6 +53,21 @@ def create_som_study_router(repo_root: str | Path) -> APIRouter:
             )
         if data.get("schema") != ALIGNMENT_SCHEMA:
             return JSONResponse({"error": {"code": "alignment_invalid", "message": "unexpected alignment schema"}},
+                                status_code=500, headers=HEADERS)
+        return JSONResponse(data, headers=HEADERS)
+
+    @router.get("/matched-pair")
+    def get_matched_pair() -> Any:
+        path = Path(repo_root) / "research_outputs" / "som_study" / "matched-pair-v1.json"
+        try:
+            data = json.loads(path.read_bytes())
+        except FileNotFoundError:
+            return JSONResponse(
+                {"error": {"code": "matched_pair_missing", "message": "Run research/build_som_matched_pair.py first."}},
+                status_code=404, headers=HEADERS,
+            )
+        if data.get("schema") != MATCHED_PAIR_SCHEMA:
+            return JSONResponse({"error": {"code": "matched_pair_invalid", "message": "unexpected matched-pair schema"}},
                                 status_code=500, headers=HEADERS)
         return JSONResponse(data, headers=HEADERS)
 

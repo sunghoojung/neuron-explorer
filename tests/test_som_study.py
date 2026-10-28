@@ -50,3 +50,18 @@ def test_neuron_alignment_route(tmp_path):
     path.write_text(json.dumps({"schema": ALIGNMENT_SCHEMA, "directions": {}}))
     response = client(tmp_path).get("/api/som-study/neurons")
     assert response.status_code == 200 and response.json()["schema"] == ALIGNMENT_SCHEMA
+
+
+def test_matched_pair_route(tmp_path):
+    from explorer.som_study_api import MATCHED_PAIR_SCHEMA
+
+    response = client(tmp_path).get("/api/som-study/matched-pair")
+    assert response.status_code == 404 and response.json()["error"]["code"] == "matched_pair_missing"
+    path = tmp_path / "research_outputs" / "som_study" / "matched-pair-v1.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"schema": "other", "map": {}}))
+    assert client(tmp_path).get("/api/som-study/matched-pair").status_code == 500
+    path.write_text(json.dumps({"schema": MATCHED_PAIR_SCHEMA, "map": {"cells": []}}))
+    response = client(tmp_path).get("/api/som-study/matched-pair")
+    assert response.status_code == 200 and response.json()["schema"] == MATCHED_PAIR_SCHEMA
+    assert response.headers["cache-control"] == "no-store"
